@@ -1,0 +1,9 @@
+# Modèles entraînés (trop lourds, se régénèrent à l'entraînement)
+*.pt
+*.pkl
+
+# Données brutes
+*.txt
+
+# Fichiers générés / exploration perso
+schema_diapo_simple.html
