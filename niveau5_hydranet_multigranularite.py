@@ -311,7 +311,7 @@ class GranularityAttention(nn.Module):
     est-ce le momentum de point, de jeu ou de set qui est
     le plus informatif ?"
     """
-    TEMPERATURE = 3.0   # > 1 → distribution plus uniforme, évite le collapse
+    TEMPERATURE = 1.5   # > 1 → distribution plus uniforme, évite le collapse
 
     def __init__(self, d_model, n_gran=3):
         super().__init__()
@@ -505,7 +505,7 @@ def train_epoch(model, loader, optimizer, ce_loss, mse_loss):
         loss_mom = mse_loss(mom_preds, ym)
         # Entropy reg : pénalise les distributions trop concentrées
         entropy  = -(gran_w * torch.log(gran_w + 1e-8)).sum(dim=-1).mean()
-        loss = loss_pts + LAMBDA_MOM * loss_mom - 0.05 * entropy
+        loss = loss_pts + LAMBDA_MOM * loss_mom - 0.01 * entropy
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
