@@ -52,8 +52,8 @@ D_MODEL         = 128
 N_HEADS         = 4
 NUM_LSTM_LAYERS = 2
 CONV_KERNEL     = 3
-EPOCHS          = 20 
-LR = 1e-4
+EPOCHS          = 30
+LR              = 1e-4
 DROPOUT         = 0.2
 LAMBDA_MOM      = 0.5       # poids loss momentum vs points
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
@@ -221,12 +221,6 @@ def load_and_prepare(csv_path: str):
     df["mom_game"]  = mom_game_list
     df["mom_set"]   = mom_set_list
 
-    from sklearn.preprocessing import StandardScaler
-    mom_scaler = StandardScaler()
-    df[["mom_point", "mom_game", "mom_set"]] = mom_scaler.fit_transform(
-        df[["mom_point", "mom_game", "mom_set"]]
-    )
-
     # Normalisation des features brutes
     scaler = StandardScaler()
     df[FEATURE_COLS] = scaler.fit_transform(df[FEATURE_COLS])
@@ -308,45 +302,60 @@ class PositionalEncoding(nn.Module):
 class GranularityAttention(nn.Module):
     """
     Module d'attention sur les 3 granularités de momentum.
-    Apprend à pondérer dynamiquement [point, jeu, set]
-    selon le contexte — c'est ici que réside l'apport principal.
+
+    Correction v2 : les poids sont calculés depuis les 3 signaux de momentum
+    eux-mêmes (self-attention temporelle), combinés avec le contexte features.
+    Temperature scaling pour éviter le collapse vers une seule granularité.
 
     Le modèle décide lui-même : "pour CE contexte de match,
     est-ce le momentum de point, de jeu ou de set qui est
     le plus informatif ?"
     """
+    TEMPERATURE = 3.0   # > 1 → distribution plus uniforme, évite le collapse
+
     def __init__(self, d_model, n_gran=3):
         super().__init__()
-        self.n_gran   = n_gran
-        # Projection de chaque granularité vers d_model
-        self.proj     = nn.Linear(1, d_model)
-        # Réseau d'attention : prend le contexte features → poids sur les 3 granularités
+        self.n_gran  = n_gran
+        # Projection de chaque granularité individuellement vers d_model/4
+        self.gran_proj = nn.Linear(1, d_model // 4)
+        # Réseau d'attention : prend [mean(mom_pt), mean(mom_jeu), mean(mom_set)]
+        # concaténé avec contexte features réduit → poids sur les 3 granularités
         self.attn_net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(n_gran + d_model // 4, d_model // 2),
             nn.Tanh(),
             nn.Linear(d_model // 2, n_gran),
         )
-        self.out_proj = nn.Linear(d_model, d_model)
+        # Projection finale vers d_model
+        self.out_proj = nn.Linear(n_gran, d_model)
+        self.ctx_proj = nn.Linear(d_model, d_model // 4)
 
     def forward(self, x_mom, context):
         """
         x_mom   : (B, T, 3) — momentum [point, jeu, set] à chaque pas
         context : (B, d_model) — vecteur de contexte issu des features
-        Retourne : (B, T, d_model) — représentation du momentum pondérée
+        Retourne : (B, T, d_model), attn_weights (B, 3)
         """
-        B, T, _ = x_mom.shape
+        # Signal de chaque granularité résumé sur T : (B, 3)
+        mom_summary = x_mom.mean(dim=1)           # moyenne temporelle des 3 mom
 
-        # Poids d'attention appris depuis le contexte : (B, 3)
-        TEMPERATURE = 2.0  # > 1 = distribution plus uniforme
-        attn_weights = torch.softmax(self.attn_net(context) / TEMPERATURE, dim=-1)
+        # Contexte features réduit : (B, d_model//4)
+        ctx_reduced = self.ctx_proj(context)       # (B, d_model//4)
+
+        # Concaténation : signaux momentum + contexte features → scores
+        scores = self.attn_net(
+            torch.cat([mom_summary, ctx_reduced], dim=-1)
+        )                                          # (B, 3)
+
+        # Temperature scaling pour éviter le collapse
+        attn_weights = torch.softmax(scores / self.TEMPERATURE, dim=-1)  # (B, 3)
 
         # Pondération des 3 granularités à chaque pas de temps
-        # x_mom : (B, T, 3) → on multiplie par attn_weights (B, 3) broadcasté
-        weighted = (x_mom * attn_weights.unsqueeze(1)).sum(dim=-1, keepdim=True)  # (B, T, 1)
+        # x_mom : (B, T, 3) * attn_weights (B, 1, 3) → (B, T, 3)
+        weighted = x_mom * attn_weights.unsqueeze(1)   # (B, T, 3)
 
         # Projection vers d_model
-        out = self.proj(weighted)       # (B, T, d_model)
-        return self.out_proj(out), attn_weights   # on retourne aussi les poids pour analyse
+        out = self.out_proj(weighted)              # (B, T, d_model)
+        return out, attn_weights
 
 
 class HydraEncoderMG(nn.Module):
@@ -490,12 +499,13 @@ def train_epoch(model, loader, optimizer, ce_loss, mse_loss):
     for Xf, Xm, yp, ym in loader:
         Xf, Xm, yp, ym = Xf.to(DEVICE), Xm.to(DEVICE), yp.to(DEVICE), ym.to(DEVICE)
         optimizer.zero_grad()
-        logits, mom_preds, gran_weights = model(Xf, Xm, PRED_LEN, yp, ym, tf_ratio=0.5)
+        logits, mom_preds, gran_w = model(Xf, Xm, PRED_LEN, yp, ym, tf_ratio=0.5)
         # Loss points (classification) + loss momentum (régression sur 3 granularités)
         loss_pts = ce_loss(logits.view(-1, 2), yp.view(-1))
-        loss_mom = mse_loss(mom_preds, ym)          # (B, PRED_LEN, 3) vs (B, PRED_LEN, 3)
-        entropy = -(gran_weights * torch.log(gran_weights + 1e-8)).sum(dim=-1).mean()
-        loss = loss_pts + LAMBDA_MOM * loss_mom - 0.01 * entropy
+        loss_mom = mse_loss(mom_preds, ym)
+        # Entropy reg : pénalise les distributions trop concentrées
+        entropy  = -(gran_w * torch.log(gran_w + 1e-8)).sum(dim=-1).mean()
+        loss = loss_pts + LAMBDA_MOM * loss_mom - 0.05 * entropy
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
