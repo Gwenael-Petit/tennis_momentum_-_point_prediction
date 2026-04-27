@@ -1,37 +1,37 @@
 """
-NIVEAU 5 v2 - Momentum Multi-Granularité (HydraNet corrigé)
-============================================================
-Corrections apportées vs v1 :
+NIVEAU 5 v3 - Momentum Multi-Granularité (HydraNet — GranularityAttention repensée)
+=====================================================================================
+Problème diagnostiqué en v2 : GranW toujours à 0.33 malgré le contexte LSTM.
+Cause racine : après StandardScaler, mom_point et mom_game ont des distributions
+quasi-identiques (std≈1 toutes les deux) → le réseau ne peut pas les distinguer
+par leurs statistiques locales. L'attention reste aveugle.
 
-  [FIX 1] GranW figés à 0.33
-    → GranularityAttention reçoit maintenant le vrai contexte LSTM (pré-run)
-      au lieu de la moyenne des features, ce qui lui donne un signal
-      discriminant dépendant du contexte du match.
-    → Les 3 momentum ne sont plus co-normalisés : chacun garde son contraste
-      naturel (mom_pt ≈ ±1 réactif, mom_game plus lissé, mom_set très plat),
-      ce qui crée un signal exploitable par l'attention.
+Corrections v3 :
 
-  [FIX 2] Data leakage du StandardScaler
-    → Le scaler des features ET les mom_scalers sont fittés uniquement sur
-      le train set, puis appliqués sur val/test.
-    → Le split est fait sur les match_id (pas sur les séquences) pour éviter
-      le leakage entre séquences chevauchantes.
+  [FIX A] Momentum non normalisé (juste clippé à [-3, 3])
+    → Préserve le contraste naturel : mom_point fluctue vite (~±0.37),
+      mom_game est plus lissé, mom_set est très plat (std=0.127).
+    → Ce contraste de fréquence/amplitude EST le signal discriminant.
 
-  [FIX 3] Bug ordre temporel dans compute_momentum_games
-    → Les jeux des sets précédents étaient ajoutés après ceux du set courant,
-      cassant l'ordre chronologique. Corrigé avec une liste triée (s, g).
+  [FIX B] GranularityAttention avec encodeurs GRU indépendants
+    → Chaque granularité est encodée par un GRU dédié (1 canal → d//4).
+    → L'attention opère sur les représentations APPRISES, pas sur des stats
+      scalaires dégénérées. Le réseau peut enfin apprendre la dynamique
+      temporelle propre à chaque granularité.
+    → La query = projection du contexte LSTM principal → attention cross.
 
-  [FIX 4] Teacher forcing décroissant
-    → tf_ratio passe de 0.9 (epoch 1) à 0.1 (epoch EPOCHS) linéairement,
-      ce qui stabilise l'entraînement et améliore la généralisation.
+  [FIX C] Momentum brut ajouté comme feature directe (skip connection)
+    → En plus de l'attention pondérée, les 3 momentum bruts sont concaténés
+      directement aux features avant la fusion. Cela garantit que l'info
+      momentum est accessible même si l'attention est encore floue en début
+      d'entraînement.
 
-  [FIX 5] Temperature apprise
-    → La temperature du softmax de GranularityAttention est un paramètre
-      appris (initialisé à 1.0, clampé > 0.1), permettant au modèle de
-      contrôler lui-même son niveau de spécialisation.
-
-  [FIX 6] Conv kernel agrandi 3→5
-    → Capture des patterns sur une fenêtre locale plus large.
+  Conservés de v2 :
+    [v2-FIX 2] Split sur match_id + scalers fittés sur train uniquement
+    [v2-FIX 3] Bug ordre chrono dans compute_momentum_games corrigé
+    [v2-FIX 4] Teacher forcing décroissant 0.9→0.1
+    [v2-FIX 5] Temperature apprise (log-paramétrisée)
+    [v2-FIX 6] Conv kernel 5
 """
 
 import math
@@ -54,14 +54,14 @@ BATCH_SIZE      = 64
 D_MODEL         = 128
 N_HEADS         = 4
 NUM_LSTM_LAYERS = 2
-CONV_KERNEL     = 5       # [FIX 6] kernel agrandi 3→5
+CONV_KERNEL     = 5
 EPOCHS          = 30
 LR              = 1e-4
 DROPOUT         = 0.2
 LAMBDA_MOM      = 0.5
+MOM_CLIP        = 3.0    # [FIX A] clip au lieu de normalisation
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── Paramètres momentum par granularité ──────
 MOM_PT_WINDOW   = 8
 MOM_PT_DECAY    = 0.85
 MOM_GAME_WINDOW = 6
@@ -88,17 +88,14 @@ FEATURE_COLS = [
     "p1_serve_speed", "p2_serve_speed",
 ]
 TARGET_COL = "Y"
+N_GRAN     = 3
+GRU_DIM    = D_MODEL // 4   # dimension des encodeurs GRU par granularité
 
 
 # ─────────────────────────────────────────────
 # 2. CALCUL DU MOMENTUM MULTI-GRANULARITÉ
 # ─────────────────────────────────────────────
 def compute_momentum_points(results: np.ndarray, window: int, decay: float) -> np.ndarray:
-    """
-    Momentum au niveau POINT.
-    Fenêtre glissante sur les résultats bruts (±1).
-    Signal le plus réactif : capte les séries de points consécutifs.
-    """
     signed  = np.where(results == 1, 1.0, -1.0)
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
@@ -111,38 +108,26 @@ def compute_momentum_points(results: np.ndarray, window: int, decay: float) -> n
 
 
 def compute_momentum_games(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
-    """
-    Momentum au niveau JEU — version corrigée [FIX 3].
-
-    v1 bug : les jeux des sets précédents étaient ajoutés après ceux du
-    set courant → liste non triée → [-window:] prenait les mauvais jeux.
-
-    Fix : on construit une liste de (set_no, game_no) triée chronologiquement,
-    puis on filtre les jeux strictement antérieurs au jeu courant.
-    """
+    """Version corrigée [v2-FIX 3] : liste triée chronologiquement."""
     momentum = np.zeros(len(df_match))
 
-    # Résultat de chaque jeu : +1 / -1
     game_results = {}
     for (s, g), grp in df_match.groupby(["set_no", "game_no"]):
         victor = grp["game_victor"].dropna()
         if len(victor) > 0:
-            last = victor.iloc[-1]
-            game_results[(s, g)] = 1.0 if last == 1 else -1.0
+            game_results[(int(s), int(g))] = 1.0 if victor.iloc[-1] == 1 else -1.0
 
-    # Liste ordonnée chronologiquement [FIX 3]
-    all_games_sorted = sorted(game_results.keys())
+    all_games_sorted = sorted(game_results.keys())   # ordre chrono garanti
 
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
 
     for idx, row in df_match.iterrows():
         s, g = int(row["set_no"]), int(row["game_no"])
-        # Jeux strictement antérieurs au jeu courant (ordre chrono garanti)
         past_games = [(ss, gg) for (ss, gg) in all_games_sorted
                       if (ss < s) or (ss == s and gg < g)]
         recent = past_games[-window:]
-        if len(recent) == 0:
+        if not recent:
             momentum[idx] = 0.0
         else:
             vals = np.array([game_results[k] for k in recent])
@@ -153,18 +138,13 @@ def compute_momentum_games(df_match: pd.DataFrame, window: int, decay: float) ->
 
 
 def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
-    """
-    Momentum au niveau SET.
-    Signal lent : avantage psychologique sur le match entier.
-    """
     momentum = np.zeros(len(df_match))
 
     set_results = {}
     for s, grp in df_match.groupby("set_no"):
         victor = grp["set_victor"].dropna()
         if len(victor) > 0:
-            last = victor.iloc[-1]
-            set_results[s] = 1.0 if last == 1 else -1.0
+            set_results[int(s)] = 1.0 if victor.iloc[-1] == 1 else -1.0
 
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
@@ -173,7 +153,7 @@ def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> 
         s = int(row["set_no"])
         past_sets = [ss for ss in sorted(set_results.keys()) if ss < s]
         recent    = past_sets[-window:]
-        if len(recent) == 0:
+        if not recent:
             momentum[idx] = 0.0
         else:
             vals = np.array([set_results[ss] for ss in recent])
@@ -188,8 +168,9 @@ def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> 
 # ─────────────────────────────────────────────
 def load_and_prepare(csv_path: str) -> pd.DataFrame:
     """
-    Retourne le DataFrame avec features + momentum BRUTS (non normalisés).
-    [FIX 2] La normalisation est déplacée après le split train/val.
+    Charge le CSV et calcule les 3 momentum BRUTS (non normalisés) [FIX A].
+    La normalisation des features est faite après le split.
+    Les momentum sont juste clippés à [-MOM_CLIP, MOM_CLIP].
     """
     df = pd.read_csv(csv_path, sep=",", low_memory=False)
 
@@ -199,7 +180,6 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
     df[TARGET_COL] = (df[TARGET_COL] == 1).astype(int)
     df = df.reset_index(drop=True)
 
-    # Calcul des 3 niveaux de momentum (valeurs brutes, pas normalisées)
     mom_pt_list, mom_game_list, mom_set_list = [], [], []
     for _, match in df.groupby("match_id"):
         match = match.sort_values("point_no").reset_index(drop=True)
@@ -211,36 +191,28 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
         mom_set_list.extend(
             compute_momentum_sets(match, MOM_SET_WINDOW, MOM_SET_DECAY).tolist())
 
-    df["mom_point"] = mom_pt_list
-    df["mom_game"]  = mom_game_list
-    df["mom_set"]   = mom_set_list
+    df["mom_point"] = np.clip(mom_pt_list,   -MOM_CLIP, MOM_CLIP)
+    df["mom_game"]  = np.clip(mom_game_list, -MOM_CLIP, MOM_CLIP)
+    df["mom_set"]   = np.clip(mom_set_list,  -MOM_CLIP, MOM_CLIP)
 
-    print(f"   mom_point (brut) — mean={df['mom_point'].mean():.3f}  std={df['mom_point'].std():.3f}")
-    print(f"   mom_game  (brut) — mean={df['mom_game'].mean():.3f}  std={df['mom_game'].std():.3f}")
-    print(f"   mom_set   (brut) — mean={df['mom_set'].mean():.3f}  std={df['mom_set'].std():.3f}")
+    print(f"   mom_point — mean={df['mom_point'].mean():.3f}  std={df['mom_point'].std():.3f}")
+    print(f"   mom_game  — mean={df['mom_game'].mean():.3f}  std={df['mom_game'].std():.3f}")
+    print(f"   mom_set   — mean={df['mom_set'].mean():.3f}  std={df['mom_set'].std():.3f}")
+    print(f"   → contraste naturel préservé (mom_set beaucoup plus plat) [FIX A]")
     return df
 
 
 def fit_and_apply_scalers(df_train: pd.DataFrame, df_val: pd.DataFrame):
     """
-    [FIX 2] Fit sur train uniquement, applique sur train + val.
-
-    [FIX 1] Les 3 momentum sont normalisés SÉPARÉMENT (pas ensemble).
-    Cela préserve leur contraste naturel d'échelle/variance, signal clé
-    pour GranularityAttention.
+    [v2-FIX 2] Fit sur train uniquement.
+    [FIX A] Les momentum ne sont PAS normalisés — leur contraste d'échelle
+    est le signal discriminant pour GranularityAttention.
     """
     feat_scaler = StandardScaler()
     df_train[FEATURE_COLS] = feat_scaler.fit_transform(df_train[FEATURE_COLS])
     df_val[FEATURE_COLS]   = feat_scaler.transform(df_val[FEATURE_COLS])
-
-    mom_scalers = {}
-    for col in ["mom_point", "mom_game", "mom_set"]:
-        sc = StandardScaler()
-        df_train[[col]] = sc.fit_transform(df_train[[col]])
-        df_val[[col]]   = sc.transform(df_val[[col]])
-        mom_scalers[col] = sc
-
-    return df_train, df_val, feat_scaler, mom_scalers
+    # Momentum : pas de StandardScaler, valeurs brutes clippées conservées
+    return df_train, df_val, feat_scaler
 
 
 # ─────────────────────────────────────────────
@@ -280,7 +252,6 @@ class TennisDataset(Dataset):
 # 5. ARCHITECTURE
 # ─────────────────────────────────────────────
 class ConvBlock(nn.Module):
-    """Capture les patterns locaux."""
     def __init__(self, in_ch, out_ch, kernel_size):
         super().__init__()
         self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, padding=(kernel_size-1)//2)
@@ -305,66 +276,117 @@ class PositionalEncoding(nn.Module):
 
 class GranularityAttention(nn.Module):
     """
-    Module d'attention sur les 3 granularités — version corrigée [FIX 1 + FIX 5].
+    Attention sur les 3 granularités — v3 avec encodeurs GRU indépendants [FIX B].
 
-    Signal d'entrée : stats momentum (mean+std par granularité = 6 valeurs)
-                    + contexte LSTM pré-calculé (d_model valeurs).
-    Cela permet d'apprendre "dans CE contexte de match, quelle granularité compte".
+    Architecture :
+      ┌─────────────────────────────────────────────────────────┐
+      │  mom_point (B,T,1) ──► GRU_pt  ──► h_pt  (B, GRU_DIM) │
+      │  mom_game  (B,T,1) ──► GRU_gm  ──► h_gm  (B, GRU_DIM) │
+      │  mom_set   (B,T,1) ──► GRU_set ──► h_set (B, GRU_DIM) │
+      └──────────────────────────┬──────────────────────────────┘
+                                 │ stack → (B, 3, GRU_DIM)
+                                 ▼
+      context (B, d_model) ──► query_proj ──► query (B, 1, GRU_DIM)
+                                 │
+                                 ▼  additive attention
+                              scores (B, 3)
+                                 │  softmax / T apprise
+                                 ▼
+                          attn_weights (B, 3)
+                                 │
+                    weighted_rep (B, GRU_DIM) ──► out_proj ──► (B, T, d_model)
 
-    La temperature est un paramètre appris (log-paramétrisé → toujours > 0) [FIX 5].
+    Pourquoi ça marche mieux :
+      - Les GRU encodent la DYNAMIQUE TEMPORELLE de chaque granularité,
+        pas juste sa moyenne/std scalaire.
+      - mom_set sera encodé différemment de mom_point même à distribution
+        similaire, car son évolution temporelle est structurellement différente
+        (quasi-constante sur 10 points vs très variable).
+      - L'attention cross avec le contexte LSTM permet de conditionner le
+        choix de granularité sur le contexte du match.
     """
-    def __init__(self, d_model, n_gran=3):
+    def __init__(self, d_model, n_gran=3, gru_dim=None):
         super().__init__()
-        self.n_gran = n_gran
-        # [FIX 1] Entrée enrichie : stats (6) + contexte LSTM (d_model)
-        self.attn_net = nn.Sequential(
-            nn.Linear(n_gran * 2 + d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, n_gran),
-        )
-        self.out_proj = nn.Linear(n_gran, d_model)
-        # [FIX 5] Temperature apprise, initialisée à 1.0
+        self.n_gran  = n_gran
+        self.gru_dim = gru_dim or (d_model // 4)
+
+        # [FIX B] Un GRU dédié par granularité (encode la dynamique temporelle)
+        self.gran_grus = nn.ModuleList([
+            nn.GRU(1, self.gru_dim, num_layers=1, batch_first=True)
+            for _ in range(n_gran)
+        ])
+
+        # Query = projection du contexte LSTM principal
+        self.query_proj = nn.Linear(d_model, self.gru_dim)
+
+        # Score = compatibilité additive (Bahdanau-style)
+        self.score_proj = nn.Linear(self.gru_dim, 1)
+
+        # Projection finale vers d_model (broadcastée sur T)
+        self.out_proj = nn.Linear(self.gru_dim, d_model)
+
+        # Temperature apprise [v2-FIX 5]
         self.log_temperature = nn.Parameter(torch.zeros(1))
 
     def forward(self, x_mom, context):
         """
         x_mom   : (B, T, 3)    — 3 granularités sur la fenêtre temporelle
-        context : (B, d_model) — contexte LSTM pré-calculé [FIX 1]
+        context : (B, d_model) — contexte LSTM pré-calculé
+        Retourne : out (B, T, d_model), attn_weights (B, 3)
         """
-        mom_mean = x_mom.mean(dim=1)           # (B, 3)
-        mom_std  = x_mom.std(dim=1) + 1e-6    # (B, 3)
+        B, T, _ = x_mom.shape
 
-        # Signal enrichi avec contexte LSTM [FIX 1]
-        stats        = torch.cat([mom_mean, mom_std, context], dim=-1)  # (B, 6+d_model)
-        scores       = self.attn_net(stats)                              # (B, 3)
+        # 1. Encoder chaque granularité avec son GRU dédié [FIX B]
+        gran_reps = []
+        for i, gru in enumerate(self.gran_grus):
+            _, h = gru(x_mom[:, :, i:i+1])      # h : (1, B, gru_dim)
+            gran_reps.append(h.squeeze(0))        # (B, gru_dim)
+        gran_reps = torch.stack(gran_reps, dim=1) # (B, 3, gru_dim)
 
-        # Temperature apprise, clampée > 0.1 [FIX 5]
-        temperature  = self.log_temperature.exp().clamp(min=0.1)
-        attn_weights = torch.softmax(scores / temperature, dim=-1)       # (B, 3)
+        # 2. Query depuis le contexte LSTM
+        query = self.query_proj(context).unsqueeze(1)  # (B, 1, gru_dim)
 
-        weighted = x_mom * attn_weights.unsqueeze(1)    # (B, T, 3)
-        out      = self.out_proj(weighted)               # (B, T, d_model)
+        # 3. Score d'attention additif (Bahdanau)
+        combined = torch.tanh(gran_reps + query)       # (B, 3, gru_dim)
+        scores   = self.score_proj(combined).squeeze(-1)  # (B, 3)
+
+        # 4. Softmax avec temperature apprise
+        temp         = self.log_temperature.exp().clamp(min=0.1)
+        attn_weights = torch.softmax(scores / temp, dim=-1)  # (B, 3)
+
+        # 5. Représentation pondérée
+        weighted_rep = (gran_reps * attn_weights.unsqueeze(-1)).sum(dim=1)  # (B, gru_dim)
+
+        # 6. Projection vers d_model et broadcast sur T
+        out = self.out_proj(weighted_rep).unsqueeze(1).expand(-1, T, -1)   # (B, T, d_model)
+
         return out, attn_weights
 
 
 class HydraEncoderMG(nn.Module):
     """
-    Encoder Multi-Granularité — version corrigée [FIX 1].
+    Encoder Multi-Granularité v3.
 
-    Modification clé : un LSTM léger (1 layer) tourne en premier sur les
-    features projetées pour produire un contexte réel (h[-1]).
-    Ce contexte est passé à GranularityAttention au lieu de la moyenne.
+    Changements vs v2 :
+      - GranularityAttention avec GRU indépendants [FIX B]
+      - Skip connection : momentum bruts concaténés aux features [FIX C]
+        → fusion_in accepte (d_model + d_model + N_GRAN) au lieu de (d_model*2)
+      - pre_lstm conservé pour produire le contexte query de l'attention
     """
-    def __init__(self, feat_size, d_model, n_heads, num_lstm_layers, conv_k, dropout):
+    def __init__(self, feat_size, d_model, n_heads, num_lstm_layers, conv_k, dropout,
+                 n_gran=N_GRAN, gru_dim=GRU_DIM):
         super().__init__()
         self.feat_proj  = nn.Linear(feat_size, d_model)
 
-        # [FIX 1] LSTM léger pour pré-contexte
-        self.pre_lstm   = nn.LSTM(d_model, d_model, num_layers=1, batch_first=True)
+        # pre_lstm : produit le contexte pour la query d'attention
+        self.pre_lstm   = nn.GRU(d_model, d_model, num_layers=1, batch_first=True)
 
-        self.gran_attn  = GranularityAttention(d_model, n_gran=3)
-        self.fusion_in  = nn.Linear(d_model * 2, d_model)
+        self.gran_attn  = GranularityAttention(d_model, n_gran=n_gran, gru_dim=gru_dim)
 
+        # [FIX C] fusion_in reçoit feat_emb + mom_emb + mom_brut (skip)
+        self.fusion_in  = nn.Linear(d_model + d_model + n_gran, d_model)
+
+        # Branches multi-scale
         self.conv_block = ConvBlock(d_model, d_model, conv_k)
         self.lstm       = nn.LSTM(d_model, d_model, num_lstm_layers, batch_first=True,
                                    dropout=dropout if num_lstm_layers > 1 else 0)
@@ -377,27 +399,31 @@ class HydraEncoderMG(nn.Module):
         self.dropout    = nn.Dropout(dropout)
 
     def forward(self, x_feat, x_mom):
+        """
+        x_feat : (B, T, F)
+        x_mom  : (B, T, 3)  — valeurs brutes clippées [FIX A]
+        """
         # 1. Projection des features
-        feat_emb = self.feat_proj(x_feat)                      # (B, T, d_model)
+        feat_emb = self.feat_proj(x_feat)              # (B, T, d_model)
 
-        # 2. Pré-run LSTM → contexte discriminant [FIX 1]
-        _, (h_pre, _) = self.pre_lstm(feat_emb)
-        pre_context   = h_pre[-1]                               # (B, d_model)
+        # 2. Pré-run GRU → contexte pour la query d'attention
+        _, h_pre    = self.pre_lstm(feat_emb)
+        pre_context = h_pre.squeeze(0)                 # (B, d_model)
 
-        # 3. Attention granularité avec vrai contexte [FIX 1]
+        # 3. Attention granularité avec GRU dédiés [FIX B]
         mom_emb, gran_weights = self.gran_attn(x_mom, pre_context)  # (B, T, d_model)
 
-        # 4. Fusion features + momentum pondéré
-        x = self.fusion_in(torch.cat([feat_emb, mom_emb], dim=-1))  # (B, T, d_model)
+        # 4. Fusion : features + momentum pondéré + momentum brut [FIX C]
+        x = self.fusion_in(torch.cat([feat_emb, mom_emb, x_mom], dim=-1))  # (B, T, d_model)
 
         # 5. Branches multi-scale
         conv_out         = self.conv_block(x)
         lstm_out, (h, c) = self.lstm(x)
         attn_out         = self.attention(self.pos_enc(x))
 
-        # 6. Fusion des derniers états
+        # 6. Fusion finale
         fused   = torch.cat([conv_out[:, -1], lstm_out[:, -1], attn_out[:, -1]], dim=-1)
-        context = self.dropout(self.fusion_out(fused))          # (B, d_model)
+        context = self.dropout(self.fusion_out(fused))  # (B, d_model)
 
         return context, h, c, gran_weights
 
@@ -427,7 +453,7 @@ class HydraPointHead(nn.Module):
 
 
 class HydraMomentumHead(nn.Module):
-    def __init__(self, d_model, num_layers, dropout, n_gran=3):
+    def __init__(self, d_model, num_layers, dropout, n_gran=N_GRAN):
         super().__init__()
         self.n_gran = n_gran
         self.lstm   = nn.LSTM(n_gran + d_model, d_model, num_layers, batch_first=True,
@@ -456,7 +482,7 @@ class HydraNetMG(nn.Module):
         self.encoder       = HydraEncoderMG(feat_size, d_model, n_heads,
                                              num_lstm_layers, conv_k, dropout)
         self.point_head    = HydraPointHead(d_model, num_lstm_layers, dropout)
-        self.momentum_head = HydraMomentumHead(d_model, num_lstm_layers, dropout, n_gran=3)
+        self.momentum_head = HydraMomentumHead(d_model, num_lstm_layers, dropout)
 
     def forward(self, x_feat, x_mom, pred_len,
                 y_points=None, y_mom=None, tf_ratio=0.5):
@@ -472,7 +498,7 @@ class HydraNetMG(nn.Module):
 # 6. ENTRAÎNEMENT & ÉVALUATION
 # ─────────────────────────────────────────────
 def get_tf_ratio(epoch: int, total: int, start: float = 0.9, end: float = 0.1) -> float:
-    """[FIX 4] Teacher forcing décroissant linéairement de start→end."""
+    """[v2-FIX 4] Teacher forcing décroissant linéairement."""
     return start + (end - start) * (epoch - 1) / max(total - 1, 1)
 
 
@@ -498,14 +524,15 @@ def evaluate(model, loader, ce_loss, mse_loss):
     model.eval()
     total_loss = 0
     preds_all, labels_all = [], []
-    mp_all, mt_all = [], []
-    gran_weights_all = []
+    mp_all, mt_all        = [], []
+    gran_weights_all      = []
 
     with torch.no_grad():
         for Xf, Xm, yp, ym in loader:
             Xf, Xm, yp, ym = Xf.to(DEVICE), Xm.to(DEVICE), yp.to(DEVICE), ym.to(DEVICE)
             logits, mom_preds, gran_w = model(Xf, Xm, PRED_LEN, tf_ratio=0.0)
-            loss = ce_loss(logits.view(-1, 2), yp.view(-1)) + LAMBDA_MOM * mse_loss(mom_preds, ym)
+            loss = (ce_loss(logits.view(-1, 2), yp.view(-1))
+                    + LAMBDA_MOM * mse_loss(mom_preds, ym))
             total_loss += loss.item()
             preds_all.extend(logits.argmax(-1).cpu().numpy().flatten())
             labels_all.extend(yp.cpu().numpy().flatten())
@@ -521,9 +548,7 @@ def evaluate(model, loader, ce_loss, mse_loss):
     mse_set  = mean_squared_error(mt_all[:,:,2].flatten(), mp_all[:,:,2].flatten())
     gran_mean = np.concatenate(gran_weights_all, axis=0).mean(axis=0)
 
-    return (total_loss / len(loader), acc,
-            mse_pt, mse_game, mse_set,
-            gran_mean)
+    return total_loss / len(loader), acc, mse_pt, mse_game, mse_set, gran_mean
 
 
 # ─────────────────────────────────────────────
@@ -533,11 +558,11 @@ if __name__ == "__main__":
     import sys
     CSV_PATH = sys.argv[1] if len(sys.argv) > 1 else "USD.txt"
 
-    print("📂 Chargement + calcul momentum multi-granularité (v2)...")
+    print("📂 Chargement + calcul momentum multi-granularité (v3)...")
     df = load_and_prepare(CSV_PATH)
     print(f"   {len(df)} points  |  {len(df['match_id'].unique())} matchs")
 
-    # ── [FIX 2] Split sur match_id avant toute normalisation ──────────────
+    # Split sur match_id avant normalisation [v2-FIX 2]
     match_ids = df["match_id"].unique()
     np.random.seed(42)
     np.random.shuffle(match_ids)
@@ -550,8 +575,8 @@ if __name__ == "__main__":
     print(f"   Train : {len(df_train)} points ({len(train_ids)} matchs)")
     print(f"   Val   : {len(df_val)} points ({len(val_ids)} matchs)")
 
-    print("\n🔧 Normalisation (fit sur train uniquement) [FIX 2]...")
-    df_train, df_val, feat_scaler, mom_scalers = fit_and_apply_scalers(df_train, df_val)
+    print("\n🔧 Normalisation features (train only) — momentum bruts conservés [FIX A]...")
+    df_train, df_val, feat_scaler = fit_and_apply_scalers(df_train, df_val)
 
     print("\n🔨 Construction des séquences...")
     X_feat_tr, X_mom_tr, y_pts_tr, y_mom_tr = build_sequences(df_train)
@@ -572,17 +597,17 @@ if __name__ == "__main__":
     mse_loss  = nn.MSELoss()
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n🚀 HydraNet MG v2 sur {DEVICE}  |  {n_params:,} paramètres\n")
+    print(f"\n🚀 HydraNet MG v3 sur {DEVICE}  |  {n_params:,} paramètres\n")
 
     best_acc = 0
     for epoch in range(1, EPOCHS + 1):
-        tf         = get_tf_ratio(epoch, EPOCHS)        # [FIX 4]
+        tf         = get_tf_ratio(epoch, EPOCHS)
         train_loss = train_epoch(model, train_loader, optimizer, ce_loss, mse_loss, tf)
         val_loss, val_acc, mse_pt, mse_game, mse_set, gran_w = evaluate(
             model, val_loader, ce_loss, mse_loss)
         scheduler.step()
 
-        temp = model.encoder.gran_attn.log_temperature.exp().item()  # [FIX 5]
+        temp = model.encoder.gran_attn.log_temperature.exp().item()
 
         print(f"Epoch {epoch:02d}/{EPOCHS} | tf={tf:.2f} | "
               f"loss={train_loss:.4f} | acc={val_acc:.4f} | "
@@ -599,14 +624,13 @@ if __name__ == "__main__":
                     "n_heads": N_HEADS, "num_lstm_layers": NUM_LSTM_LAYERS,
                     "conv_k": CONV_KERNEL, "dropout": DROPOUT,
                 },
-            }, "best_hydranet_mg_v2.pt")
-            joblib.dump(feat_scaler,  "feat_scaler_mg_v2.pkl")
-            joblib.dump(mom_scalers,  "mom_scalers_mg_v2.pkl")
+            }, "best_hydranet_mg_v3.pt")
+            joblib.dump(feat_scaler, "feat_scaler_mg_v3.pkl")
 
     print(f"\n✅ Meilleure val_acc : {best_acc:.4f}")
-    print("\n📊 Poids de granularité moyens (dernière epoch) :")
+    print("\n📊 Poids de granularité moyens (dernière epoch val) :")
     print(f"   Point : {gran_w[0]:.3f}  |  Jeu : {gran_w[1]:.3f}  |  Set : {gran_w[2]:.3f}")
     print(f"   Temperature finale : {model.encoder.gran_attn.log_temperature.exp().item():.3f}")
-    print("\n   → Si T < 1 : le modèle a appris à se spécialiser (distribution piquée)")
-    print("   → Si T > 1 : le modèle préfère l'uniformité (distribution plate)")
-    print("\n   Checkpoint sauvegardé dans best_hydranet_mg_v2.pt")
+    print("\n   → T < 1 : spécialisation (poids piqués sur une granularité)")
+    print("   → T > 1 : uniformité (le modèle juge les 3 équivalentes)")
+    print("\n   Checkpoint : best_hydranet_mg_v3.pt")
