@@ -303,58 +303,44 @@ class GranularityAttention(nn.Module):
     """
     Module d'attention sur les 3 granularités de momentum.
 
-    Correction v2 : les poids sont calculés depuis les 3 signaux de momentum
-    eux-mêmes (self-attention temporelle), combinés avec le contexte features.
-    Temperature scaling pour éviter le collapse vers une seule granularité.
-
-    Le modèle décide lui-même : "pour CE contexte de match,
-    est-ce le momentum de point, de jeu ou de set qui est
-    le plus informatif ?"
+    v3 — signal discriminant : mean + std sur la fenêtre de 10 points.
+    La std capture l'activité de chaque granularité — c'est ce qui
+    varie entre les exemples même après normalisation globale.
     """
-    TEMPERATURE = 1.5   # > 1 → distribution plus uniforme, évite le collapse
+    TEMPERATURE = 1.2
 
     def __init__(self, d_model, n_gran=3):
         super().__init__()
-        self.n_gran  = n_gran
-        # Projection de chaque granularité individuellement vers d_model/4
-        self.gran_proj = nn.Linear(1, d_model // 4)
-        # Réseau d'attention : prend [mean(mom_pt), mean(mom_jeu), mean(mom_set)]
-        # concaténé avec contexte features réduit → poids sur les 3 granularités
+        self.n_gran   = n_gran
+        # Entrée : [mean_pt, std_pt, mean_jeu, std_jeu, mean_set, std_set] = 6 valeurs
         self.attn_net = nn.Sequential(
-            nn.Linear(n_gran + d_model // 4, d_model // 2),
-            nn.Tanh(),
+            nn.Linear(n_gran * 2, d_model // 2),
+            nn.ReLU(),
             nn.Linear(d_model // 2, n_gran),
         )
-        # Projection finale vers d_model
         self.out_proj = nn.Linear(n_gran, d_model)
-        self.ctx_proj = nn.Linear(d_model, d_model // 4)
 
     def forward(self, x_mom, context):
         """
-        x_mom   : (B, T, 3) — momentum [point, jeu, set] à chaque pas
-        context : (B, d_model) — vecteur de contexte issu des features
-        Retourne : (B, T, d_model), attn_weights (B, 3)
+        x_mom   : (B, T, 3)
+        context : (B, d_model) — gardé pour compatibilité
         """
-        # Signal de chaque granularité résumé sur T : (B, 3)
-        mom_summary = x_mom.mean(dim=1)           # moyenne temporelle des 3 mom
+        # Statistiques locales sur la fenêtre de 10 points
+        mom_mean = x_mom.mean(dim=1)           # (B, 3)
+        mom_std  = x_mom.std(dim=1) + 1e-6    # (B, 3) activité par granularité
 
-        # Contexte features réduit : (B, d_model//4)
-        ctx_reduced = self.ctx_proj(context)       # (B, d_model//4)
+        # Signal discriminant (B, 6)
+        stats = torch.cat([mom_mean, mom_std], dim=-1)
 
-        # Concaténation : signaux momentum + contexte features → scores
-        scores = self.attn_net(
-            torch.cat([mom_summary, ctx_reduced], dim=-1)
-        )                                          # (B, 3)
-
-        # Temperature scaling pour éviter le collapse
+        # Scores et poids avec temperature scaling
+        scores       = self.attn_net(stats)
         attn_weights = torch.softmax(scores / self.TEMPERATURE, dim=-1)  # (B, 3)
 
-        # Pondération des 3 granularités à chaque pas de temps
-        # x_mom : (B, T, 3) * attn_weights (B, 1, 3) → (B, T, 3)
+        # Pondération : (B, T, 3) * (B, 1, 3)
         weighted = x_mom * attn_weights.unsqueeze(1)   # (B, T, 3)
 
         # Projection vers d_model
-        out = self.out_proj(weighted)              # (B, T, d_model)
+        out = self.out_proj(weighted)          # (B, T, d_model)
         return out, attn_weights
 
 
