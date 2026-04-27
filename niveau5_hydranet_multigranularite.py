@@ -1,37 +1,40 @@
 """
-NIVEAU 5 v3 - Momentum Multi-Granularité (HydraNet — GranularityAttention repensée)
-=====================================================================================
-Problème diagnostiqué en v2 : GranW toujours à 0.33 malgré le contexte LSTM.
-Cause racine : après StandardScaler, mom_point et mom_game ont des distributions
-quasi-identiques (std≈1 toutes les deux) → le réseau ne peut pas les distinguer
-par leurs statistiques locales. L'attention reste aveugle.
+NIVEAU 5 v4 - HydraNet à 3 Signaux Hétérogènes
+================================================
+Rupture fondamentale avec v1/v2/v3 :
 
-Corrections v3 :
+Les 3 versions précédentes utilisaient 3 fenêtres glissantes sur le même
+signal binaire Y (victoire du point). Après normalisation, les 3 canaux
+deviennent quasi-identiques → l'attention n'a rien à discriminer → 0.33.
 
-  [FIX A] Momentum non normalisé (juste clippé à [-3, 3])
-    → Préserve le contraste naturel : mom_point fluctue vite (~±0.37),
-      mom_game est plus lissé, mom_set est très plat (std=0.127).
-    → Ce contraste de fréquence/amplitude EST le signal discriminant.
+v4 remplace les 3 granularités temporelles par 3 SIGNAUX DE NATURE DIFFÉRENTE :
 
-  [FIX B] GranularityAttention avec encodeurs GRU indépendants
-    → Chaque granularité est encodée par un GRU dédié (1 canal → d//4).
-    → L'attention opère sur les représentations APPRISES, pas sur des stats
-      scalaires dégénérées. Le réseau peut enfin apprendre la dynamique
-      temporelle propre à chaque granularité.
-    → La query = projection du contexte LSTM principal → attention cross.
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  [S1] mom_psycho  : momentum classique sur les points (haute fréq.)  │
+  │       → "Est-il dans une bonne série de points ?"                    │
+  │       Dynamique : fluctue point par point, très bruité               │
+  │                                                                      │
+  │  [S2] mom_tactical: efficacité sur les moments clés (basse fréq.)    │
+  │       → "Gagne-t-il quand ça compte ? (break pts, deuce, AD)"        │
+  │       Dynamique : événementielle, longues plages à 0 entre les       │
+  │                   points importants → structurellement différent      │
+  │                                                                      │
+  │  [S3] mom_physical: tendance physique (monotone lente)               │
+  │       → "Sa forme physique se dégrade-t-elle ?"                      │
+  │       Dynamique : tendance lente sur serve_speed + unf_err +         │
+  │                   distance_run → quasi-monotone intra-set            │
+  └──────────────────────────────────────────────────────────────────────┘
 
-  [FIX C] Momentum brut ajouté comme feature directe (skip connection)
-    → En plus de l'attention pondérée, les 3 momentum bruts sont concaténés
-      directement aux features avant la fusion. Cela garantit que l'info
-      momentum est accessible même si l'attention est encore floue en début
-      d'entraînement.
+Ces 3 signaux ont des DYNAMIQUES TEMPORELLES structurellement différentes.
+Les GRU dédiés de GranularityAttention peuvent enfin les distinguer.
 
-  Conservés de v2 :
-    [v2-FIX 2] Split sur match_id + scalers fittés sur train uniquement
-    [v2-FIX 3] Bug ordre chrono dans compute_momentum_games corrigé
-    [v2-FIX 4] Teacher forcing décroissant 0.9→0.1
-    [v2-FIX 5] Temperature apprise (log-paramétrisée)
-    [v2-FIX 6] Conv kernel 5
+L'attention apprend alors : dans ce contexte de match,
+  - un bris de dynamique physique → S3 dominant
+  - un joueur qui perd tous ses break points → S2 dominant
+  - une série de 5 points consécutifs → S1 dominant
+
+Conservé de v3 : GRU indépendants, skip connection, teacher forcing
+décroissant, temperature apprise, split match_id, scaler train-only.
 """
 
 import math
@@ -58,16 +61,21 @@ CONV_KERNEL     = 5
 EPOCHS          = 30
 LR              = 1e-4
 DROPOUT         = 0.2
-LAMBDA_MOM      = 0.5
-MOM_CLIP        = 3.0    # [FIX A] clip au lieu de normalisation
+LAMBDA_MOM      = 0.3        # réduit car les 3 signaux sont + difficiles à prédire
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
 
-MOM_PT_WINDOW   = 8
-MOM_PT_DECAY    = 0.85
-MOM_GAME_WINDOW = 6
-MOM_GAME_DECAY  = 0.75
-MOM_SET_WINDOW  = 4
-MOM_SET_DECAY   = 0.60
+# Paramètres S1 (psychologique)
+MOM_PSY_WINDOW  = 8
+MOM_PSY_DECAY   = 0.85
+
+# Paramètres S2 (tactique) — fenêtre en nombre de POINTS IMPORTANTS
+MOM_TAC_WINDOW  = 6          # 6 derniers points "importants"
+MOM_TAC_DECAY   = 0.80
+
+# Paramètres S3 (physique) — fenêtre glissante sur les stats physiques
+MOM_PHY_WINDOW  = 12         # plus longue : tendance lente
+
+MOM_CLIP        = 3.0        # clip au lieu de normalisation (préserve le contraste)
 
 SCORE_MAP = {'0': 0, '15': 1, '30': 2, '40': 3, 'AD': 4,
               0: 0,  15: 1,  30: 2,  40: 3}
@@ -89,76 +97,136 @@ FEATURE_COLS = [
 ]
 TARGET_COL = "Y"
 N_GRAN     = 3
-GRU_DIM    = D_MODEL // 4   # dimension des encodeurs GRU par granularité
+GRU_DIM    = D_MODEL // 4
 
 
 # ─────────────────────────────────────────────
-# 2. CALCUL DU MOMENTUM MULTI-GRANULARITÉ
+# 2. CALCUL DES 3 SIGNAUX HÉTÉROGÈNES
 # ─────────────────────────────────────────────
-def compute_momentum_points(results: np.ndarray, window: int, decay: float) -> np.ndarray:
+
+def compute_signal_psycho(results: np.ndarray, window: int, decay: float) -> np.ndarray:
+    """
+    S1 — Momentum psychologique.
+    Fenêtre glissante pondérée sur les victoires/défaites de points.
+    Signal : haute fréquence, très bruité, fluctue point par point.
+    Inchangé vs v1 : c'est le signal de référence.
+    """
     signed  = np.where(results == 1, 1.0, -1.0)
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
     momentum = np.zeros(len(signed))
     for t in range(len(signed)):
+        start        = max(0, t - window + 1)
+        w            = weights[-(t - start + 1):]
+        momentum[t]  = np.dot(signed[start : t + 1], w)
+    return momentum.astype(np.float32)
+
+
+def _is_pressure_point(s1: int, s2: int) -> bool:
+    """
+    Retourne True si le score courant est un "moment clé" :
+    break point, deuce, AD, ou score serré en fin de jeu (40-30, 30-40).
+    s1, s2 : scores encodés (0=0, 1=15, 2=30, 3=40, 4=AD)
+    """
+    # Deuce / Avantage
+    if s1 >= 3 and s2 >= 3:
+        return True
+    # Break point pour le relanceur (serveur à 40, relanceur à 30 ou 40)
+    if s1 == 3 and s2 >= 2:
+        return True
+    if s2 == 3 and s1 >= 2:
+        return True
+    return False
+
+
+def compute_signal_tactical(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
+    """
+    S2 — Momentum tactique.
+    Ne s'actualise QUE sur les points importants (break pts, deuce, AD).
+    Entre deux points importants, la valeur reste constante (plateau).
+
+    Dynamique temporelle : événementielle, avec de longues plages plates
+    entre les moments clés. Structurellement différent de S1 (qui varie
+    à chaque point) et de S3 (qui est monotone).
+
+    +1 si J1 gagne le point important, -1 sinon.
+    Pondération exponentielle sur les `window` derniers points importants.
+    """
+    p1_scores = df_match["p1_score"].values
+    p2_scores = df_match["p2_score"].values
+    results   = df_match[TARGET_COL].values
+
+    weights = np.array([decay ** k for k in range(window)])
+    weights /= weights.sum()
+
+    key_results  = []   # historique des résultats sur points importants
+    momentum     = np.zeros(len(df_match))
+    last_mom     = 0.0
+
+    for t in range(len(df_match)):
+        s1 = int(p1_scores[t]) if not np.isnan(p1_scores[t]) else 0
+        s2 = int(p2_scores[t]) if not np.isnan(p2_scores[t]) else 0
+
+        if _is_pressure_point(s1, s2):
+            key_results.append(1.0 if results[t] == 1 else -1.0)
+            recent   = key_results[-window:]
+            w        = weights[-len(recent):]
+            last_mom = float(np.dot(recent, w))
+
+        momentum[t] = last_mom
+
+    return momentum.astype(np.float32)
+
+
+def compute_signal_physical(df_match: pd.DataFrame, window: int) -> np.ndarray:
+    """
+    S3 — Momentum physique.
+    Capture la TENDANCE de dégradation/amélioration physique relative de J1
+    par rapport à J2 sur une fenêtre glissante.
+
+    Composantes normalisées et combinées :
+      - serve_speed_diff  = p1_serve_speed - p2_serve_speed
+        (vitesse de service : diminue avec la fatigue)
+      - unf_err_diff      = p2_unf_err - p1_unf_err
+        (erreurs non forcées : augmentent avec la fatigue — signe inversé)
+      - distance_diff     = p1_distance_run - p2_distance_run
+        (distance courue : signal ambigu — peut indiquer défense forcée)
+
+    On calcule la TENDANCE (slope) de la somme pondérée sur la fenêtre,
+    pas juste la moyenne : ce qui compte c'est si ça se dégrade ou s'améliore.
+
+    Dynamique : quasi-monotone intra-set, basse fréquence.
+    """
+    serve_diff = (df_match["p1_serve_speed"].fillna(0).values
+                  - df_match["p2_serve_speed"].fillna(0).values)
+    err_diff   = (df_match["p2_unf_err"].fillna(0).values
+                  - df_match["p1_unf_err"].fillna(0).values)
+    dist_diff  = (df_match["p1_distance_run"].fillna(0).values
+                  - df_match["p2_distance_run"].fillna(0).values)
+
+    # Normalisation locale (évite les problèmes d'échelle entre les 3 composantes)
+    def _norm(x):
+        std = x.std()
+        return (x - x.mean()) / (std + 1e-8) if std > 1e-8 else np.zeros_like(x)
+
+    composite  = _norm(serve_diff) + _norm(err_diff) + _norm(dist_diff)
+
+    # Tendance (slope) sur fenêtre glissante via régression linéaire simple
+    momentum = np.zeros(len(composite))
+    for t in range(len(composite)):
         start = max(0, t - window + 1)
-        w     = weights[-(t - start + 1):]
-        momentum[t] = np.dot(signed[start : t + 1], w)
-    return momentum.astype(np.float32)
-
-
-def compute_momentum_games(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
-    """Version corrigée [v2-FIX 3] : liste triée chronologiquement."""
-    momentum = np.zeros(len(df_match))
-
-    game_results = {}
-    for (s, g), grp in df_match.groupby(["set_no", "game_no"]):
-        victor = grp["game_victor"].dropna()
-        if len(victor) > 0:
-            game_results[(int(s), int(g))] = 1.0 if victor.iloc[-1] == 1 else -1.0
-
-    all_games_sorted = sorted(game_results.keys())   # ordre chrono garanti
-
-    weights = np.array([decay ** k for k in range(window)])
-    weights /= weights.sum()
-
-    for idx, row in df_match.iterrows():
-        s, g = int(row["set_no"]), int(row["game_no"])
-        past_games = [(ss, gg) for (ss, gg) in all_games_sorted
-                      if (ss < s) or (ss == s and gg < g)]
-        recent = past_games[-window:]
-        if not recent:
-            momentum[idx] = 0.0
+        seg   = composite[start : t + 1]
+        if len(seg) < 3:
+            momentum[t] = 0.0
         else:
-            vals = np.array([game_results[k] for k in recent])
-            w    = weights[-len(vals):]
-            momentum[idx] = np.dot(vals, w)
-
-    return momentum.astype(np.float32)
-
-
-def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
-    momentum = np.zeros(len(df_match))
-
-    set_results = {}
-    for s, grp in df_match.groupby("set_no"):
-        victor = grp["set_victor"].dropna()
-        if len(victor) > 0:
-            set_results[int(s)] = 1.0 if victor.iloc[-1] == 1 else -1.0
-
-    weights = np.array([decay ** k for k in range(window)])
-    weights /= weights.sum()
-
-    for idx, row in df_match.iterrows():
-        s = int(row["set_no"])
-        past_sets = [ss for ss in sorted(set_results.keys()) if ss < s]
-        recent    = past_sets[-window:]
-        if not recent:
-            momentum[idx] = 0.0
-        else:
-            vals = np.array([set_results[ss] for ss in recent])
-            w    = weights[-len(vals):]
-            momentum[idx] = np.dot(vals, w)
+            # Slope normalisée de la régression linéaire
+            x     = np.arange(len(seg), dtype=np.float32)
+            x    -= x.mean()
+            denom = (x * x).sum()
+            if denom > 1e-8:
+                momentum[t] = float((x * seg).sum() / denom)
+            else:
+                momentum[t] = 0.0
 
     return momentum.astype(np.float32)
 
@@ -168,9 +236,9 @@ def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> 
 # ─────────────────────────────────────────────
 def load_and_prepare(csv_path: str) -> pd.DataFrame:
     """
-    Charge le CSV et calcule les 3 momentum BRUTS (non normalisés) [FIX A].
-    La normalisation des features est faite après le split.
-    Les momentum sont juste clippés à [-MOM_CLIP, MOM_CLIP].
+    Charge le CSV et calcule les 3 signaux hétérogènes BRUTS (clippés).
+    La normalisation des features est faite après le split train/val.
+    Les signaux momentum sont clippés à [-MOM_CLIP, MOM_CLIP] sans normalisation.
     """
     df = pd.read_csv(csv_path, sep=",", low_memory=False)
 
@@ -180,38 +248,45 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
     df[TARGET_COL] = (df[TARGET_COL] == 1).astype(int)
     df = df.reset_index(drop=True)
 
-    mom_pt_list, mom_game_list, mom_set_list = [], [], []
+    s1_list, s2_list, s3_list = [], [], []
     for _, match in df.groupby("match_id"):
         match = match.sort_values("point_no").reset_index(drop=True)
-        mom_pt_list.extend(
-            compute_momentum_points(match[TARGET_COL].values,
-                                    MOM_PT_WINDOW, MOM_PT_DECAY).tolist())
-        mom_game_list.extend(
-            compute_momentum_games(match, MOM_GAME_WINDOW, MOM_GAME_DECAY).tolist())
-        mom_set_list.extend(
-            compute_momentum_sets(match, MOM_SET_WINDOW, MOM_SET_DECAY).tolist())
+        s1_list.extend(
+            compute_signal_psycho(match[TARGET_COL].values,
+                                  MOM_PSY_WINDOW, MOM_PSY_DECAY).tolist())
+        s2_list.extend(
+            compute_signal_tactical(match, MOM_TAC_WINDOW, MOM_TAC_DECAY).tolist())
+        s3_list.extend(
+            compute_signal_physical(match, MOM_PHY_WINDOW).tolist())
 
-    df["mom_point"] = np.clip(mom_pt_list,   -MOM_CLIP, MOM_CLIP)
-    df["mom_game"]  = np.clip(mom_game_list, -MOM_CLIP, MOM_CLIP)
-    df["mom_set"]   = np.clip(mom_set_list,  -MOM_CLIP, MOM_CLIP)
+    df["mom_psycho"]   = np.clip(s1_list, -MOM_CLIP, MOM_CLIP)
+    df["mom_tactical"] = np.clip(s2_list, -MOM_CLIP, MOM_CLIP)
+    df["mom_physical"] = np.clip(s3_list, -MOM_CLIP, MOM_CLIP)
 
-    print(f"   mom_point — mean={df['mom_point'].mean():.3f}  std={df['mom_point'].std():.3f}")
-    print(f"   mom_game  — mean={df['mom_game'].mean():.3f}  std={df['mom_game'].std():.3f}")
-    print(f"   mom_set   — mean={df['mom_set'].mean():.3f}  std={df['mom_set'].std():.3f}")
-    print(f"   → contraste naturel préservé (mom_set beaucoup plus plat) [FIX A]")
+    print(f"   mom_psycho   — mean={df['mom_psycho'].mean():.3f}  "
+          f"std={df['mom_psycho'].std():.3f}  "
+          f"(fréq. élevée : varie chaque point)")
+    print(f"   mom_tactical — mean={df['mom_tactical'].mean():.3f}  "
+          f"std={df['mom_tactical'].std():.3f}  "
+          f"(événementiel : plateaux entre moments clés)")
+    pct_nonzero = (df["mom_tactical"] != 0).mean() * 100
+    print(f"                  {pct_nonzero:.1f}% de points non-nuls (moments clés)")
+    print(f"   mom_physical — mean={df['mom_physical'].mean():.3f}  "
+          f"std={df['mom_physical'].std():.3f}  "
+          f"(tendance lente : slope physique)")
+
     return df
 
 
+MOM_COLS = ["mom_psycho", "mom_tactical", "mom_physical"]
+
+
 def fit_and_apply_scalers(df_train: pd.DataFrame, df_val: pd.DataFrame):
-    """
-    [v2-FIX 2] Fit sur train uniquement.
-    [FIX A] Les momentum ne sont PAS normalisés — leur contraste d'échelle
-    est le signal discriminant pour GranularityAttention.
-    """
+    """Fit sur train uniquement, applique sur train+val."""
     feat_scaler = StandardScaler()
     df_train[FEATURE_COLS] = feat_scaler.fit_transform(df_train[FEATURE_COLS])
     df_val[FEATURE_COLS]   = feat_scaler.transform(df_val[FEATURE_COLS])
-    # Momentum : pas de StandardScaler, valeurs brutes clippées conservées
+    # Momentum : PAS de normalisation, contraste naturel préservé
     return df_train, df_val, feat_scaler
 
 
@@ -224,7 +299,7 @@ def build_sequences(df: pd.DataFrame):
         match    = match.sort_values("point_no").reset_index(drop=True)
         features = match[FEATURE_COLS].values
         points   = match[TARGET_COL].values
-        moms     = match[["mom_point", "mom_game", "mom_set"]].values
+        moms     = match[MOM_COLS].values
 
         for i in range(len(match) - SEQ_LEN - PRED_LEN + 1):
             X_feat.append(features[i : i + SEQ_LEN])
@@ -276,114 +351,80 @@ class PositionalEncoding(nn.Module):
 
 class GranularityAttention(nn.Module):
     """
-    Attention sur les 3 granularités — v3 avec encodeurs GRU indépendants [FIX B].
+    Attention sur les 3 signaux hétérogènes avec GRU indépendants.
 
-    Architecture :
-      ┌─────────────────────────────────────────────────────────┐
-      │  mom_point (B,T,1) ──► GRU_pt  ──► h_pt  (B, GRU_DIM) │
-      │  mom_game  (B,T,1) ──► GRU_gm  ──► h_gm  (B, GRU_DIM) │
-      │  mom_set   (B,T,1) ──► GRU_set ──► h_set (B, GRU_DIM) │
-      └──────────────────────────┬──────────────────────────────┘
-                                 │ stack → (B, 3, GRU_DIM)
-                                 ▼
-      context (B, d_model) ──► query_proj ──► query (B, 1, GRU_DIM)
-                                 │
-                                 ▼  additive attention
-                              scores (B, 3)
-                                 │  softmax / T apprise
-                                 ▼
-                          attn_weights (B, 3)
-                                 │
-                    weighted_rep (B, GRU_DIM) ──► out_proj ──► (B, T, d_model)
+    Chaque signal a son GRU dédié qui encode sa dynamique temporelle propre :
+      - GRU_psycho  encode les fluctuations rapides point-à-point
+      - GRU_tactical encode les plateaux et sauts événementiels
+      - GRU_physical encode la tendance monotone lente
 
-    Pourquoi ça marche mieux :
-      - Les GRU encodent la DYNAMIQUE TEMPORELLE de chaque granularité,
-        pas juste sa moyenne/std scalaire.
-      - mom_set sera encodé différemment de mom_point même à distribution
-        similaire, car son évolution temporelle est structurellement différente
-        (quasi-constante sur 10 points vs très variable).
-      - L'attention cross avec le contexte LSTM permet de conditionner le
-        choix de granularité sur le contexte du match.
+    Ces 3 dynamiques sont structurellement différentes → les GRU produisent
+    des représentations réellement distinctes → l'attention peut discriminer.
+
+    Query = contexte LSTM principal (dépend du contexte du match).
+    Score = compatibilité additive Bahdanau entre chaque représentation et query.
     """
-    def __init__(self, d_model, n_gran=3, gru_dim=None):
+    def __init__(self, d_model, n_gran=N_GRAN, gru_dim=GRU_DIM):
         super().__init__()
         self.n_gran  = n_gran
-        self.gru_dim = gru_dim or (d_model // 4)
+        self.gru_dim = gru_dim
 
-        # [FIX B] Un GRU dédié par granularité (encode la dynamique temporelle)
         self.gran_grus = nn.ModuleList([
-            nn.GRU(1, self.gru_dim, num_layers=1, batch_first=True)
+            nn.GRU(1, gru_dim, num_layers=1, batch_first=True)
             for _ in range(n_gran)
         ])
 
-        # Query = projection du contexte LSTM principal
-        self.query_proj = nn.Linear(d_model, self.gru_dim)
-
-        # Score = compatibilité additive (Bahdanau-style)
-        self.score_proj = nn.Linear(self.gru_dim, 1)
-
-        # Projection finale vers d_model (broadcastée sur T)
-        self.out_proj = nn.Linear(self.gru_dim, d_model)
-
-        # Temperature apprise [v2-FIX 5]
+        self.query_proj  = nn.Linear(d_model, gru_dim)
+        self.score_proj  = nn.Linear(gru_dim, 1)
+        self.out_proj    = nn.Linear(gru_dim, d_model)
         self.log_temperature = nn.Parameter(torch.zeros(1))
 
     def forward(self, x_mom, context):
         """
-        x_mom   : (B, T, 3)    — 3 granularités sur la fenêtre temporelle
-        context : (B, d_model) — contexte LSTM pré-calculé
-        Retourne : out (B, T, d_model), attn_weights (B, 3)
+        x_mom   : (B, T, 3)    — 3 signaux hétérogènes sur la fenêtre
+        context : (B, d_model) — contexte GRU pré-calculé (query)
         """
         B, T, _ = x_mom.shape
 
-        # 1. Encoder chaque granularité avec son GRU dédié [FIX B]
+        # Encoder chaque signal avec son GRU dédié
         gran_reps = []
         for i, gru in enumerate(self.gran_grus):
-            _, h = gru(x_mom[:, :, i:i+1])      # h : (1, B, gru_dim)
-            gran_reps.append(h.squeeze(0))        # (B, gru_dim)
-        gran_reps = torch.stack(gran_reps, dim=1) # (B, 3, gru_dim)
+            _, h = gru(x_mom[:, :, i:i+1])       # h : (1, B, gru_dim)
+            gran_reps.append(h.squeeze(0))         # (B, gru_dim)
+        gran_reps = torch.stack(gran_reps, dim=1)  # (B, 3, gru_dim)
 
-        # 2. Query depuis le contexte LSTM
-        query = self.query_proj(context).unsqueeze(1)  # (B, 1, gru_dim)
+        # Query depuis le contexte
+        query = self.query_proj(context).unsqueeze(1)      # (B, 1, gru_dim)
 
-        # 3. Score d'attention additif (Bahdanau)
-        combined = torch.tanh(gran_reps + query)       # (B, 3, gru_dim)
-        scores   = self.score_proj(combined).squeeze(-1)  # (B, 3)
+        # Score additif Bahdanau
+        combined = torch.tanh(gran_reps + query)           # (B, 3, gru_dim)
+        scores   = self.score_proj(combined).squeeze(-1)   # (B, 3)
 
-        # 4. Softmax avec temperature apprise
         temp         = self.log_temperature.exp().clamp(min=0.1)
         attn_weights = torch.softmax(scores / temp, dim=-1)  # (B, 3)
 
-        # 5. Représentation pondérée
+        # Représentation pondérée → projection → broadcast sur T
         weighted_rep = (gran_reps * attn_weights.unsqueeze(-1)).sum(dim=1)  # (B, gru_dim)
-
-        # 6. Projection vers d_model et broadcast sur T
-        out = self.out_proj(weighted_rep).unsqueeze(1).expand(-1, T, -1)   # (B, T, d_model)
+        out = self.out_proj(weighted_rep).unsqueeze(1).expand(-1, T, -1)    # (B, T, d_model)
 
         return out, attn_weights
 
 
 class HydraEncoderMG(nn.Module):
     """
-    Encoder Multi-Granularité v3.
-
-    Changements vs v2 :
-      - GranularityAttention avec GRU indépendants [FIX B]
-      - Skip connection : momentum bruts concaténés aux features [FIX C]
-        → fusion_in accepte (d_model + d_model + N_GRAN) au lieu de (d_model*2)
-      - pre_lstm conservé pour produire le contexte query de l'attention
+    Encoder avec GRU pré-contexte + GranularityAttention + skip connection.
     """
     def __init__(self, feat_size, d_model, n_heads, num_lstm_layers, conv_k, dropout,
                  n_gran=N_GRAN, gru_dim=GRU_DIM):
         super().__init__()
         self.feat_proj  = nn.Linear(feat_size, d_model)
 
-        # pre_lstm : produit le contexte pour la query d'attention
-        self.pre_lstm   = nn.GRU(d_model, d_model, num_layers=1, batch_first=True)
+        # GRU léger pour pré-contexte (query de l'attention)
+        self.pre_gru    = nn.GRU(d_model, d_model, num_layers=1, batch_first=True)
 
         self.gran_attn  = GranularityAttention(d_model, n_gran=n_gran, gru_dim=gru_dim)
 
-        # [FIX C] fusion_in reçoit feat_emb + mom_emb + mom_brut (skip)
+        # Skip connection : feat_emb (d) + mom_emb (d) + mom bruts (3)
         self.fusion_in  = nn.Linear(d_model + d_model + n_gran, d_model)
 
         # Branches multi-scale
@@ -399,31 +440,25 @@ class HydraEncoderMG(nn.Module):
         self.dropout    = nn.Dropout(dropout)
 
     def forward(self, x_feat, x_mom):
-        """
-        x_feat : (B, T, F)
-        x_mom  : (B, T, 3)  — valeurs brutes clippées [FIX A]
-        """
-        # 1. Projection des features
-        feat_emb = self.feat_proj(x_feat)              # (B, T, d_model)
+        feat_emb = self.feat_proj(x_feat)                  # (B, T, d_model)
 
-        # 2. Pré-run GRU → contexte pour la query d'attention
-        _, h_pre    = self.pre_lstm(feat_emb)
-        pre_context = h_pre.squeeze(0)                 # (B, d_model)
+        # Pré-contexte via GRU
+        _, h_pre    = self.pre_gru(feat_emb)
+        pre_context = h_pre.squeeze(0)                     # (B, d_model)
 
-        # 3. Attention granularité avec GRU dédiés [FIX B]
+        # Attention sur les 3 signaux hétérogènes
         mom_emb, gran_weights = self.gran_attn(x_mom, pre_context)  # (B, T, d_model)
 
-        # 4. Fusion : features + momentum pondéré + momentum brut [FIX C]
+        # Fusion avec skip connection des signaux bruts
         x = self.fusion_in(torch.cat([feat_emb, mom_emb, x_mom], dim=-1))  # (B, T, d_model)
 
-        # 5. Branches multi-scale
+        # Branches multi-scale
         conv_out         = self.conv_block(x)
         lstm_out, (h, c) = self.lstm(x)
         attn_out         = self.attention(self.pos_enc(x))
 
-        # 6. Fusion finale
         fused   = torch.cat([conv_out[:, -1], lstm_out[:, -1], attn_out[:, -1]], dim=-1)
-        context = self.dropout(self.fusion_out(fused))  # (B, d_model)
+        context = self.dropout(self.fusion_out(fused))
 
         return context, h, c, gran_weights
 
@@ -497,12 +532,11 @@ class HydraNetMG(nn.Module):
 # ─────────────────────────────────────────────
 # 6. ENTRAÎNEMENT & ÉVALUATION
 # ─────────────────────────────────────────────
-def get_tf_ratio(epoch: int, total: int, start: float = 0.9, end: float = 0.1) -> float:
-    """[v2-FIX 4] Teacher forcing décroissant linéairement."""
+def get_tf_ratio(epoch: int, total: int, start=0.9, end=0.1) -> float:
     return start + (end - start) * (epoch - 1) / max(total - 1, 1)
 
 
-def train_epoch(model, loader, optimizer, ce_loss, mse_loss, tf_ratio: float):
+def train_epoch(model, loader, optimizer, ce_loss, mse_loss, tf_ratio):
     model.train()
     total_loss = 0
     for Xf, Xm, yp, ym in loader:
@@ -511,6 +545,7 @@ def train_epoch(model, loader, optimizer, ce_loss, mse_loss, tf_ratio: float):
         logits, mom_preds, gran_w = model(Xf, Xm, PRED_LEN, yp, ym, tf_ratio=tf_ratio)
         loss_pts = ce_loss(logits.view(-1, 2), yp.view(-1))
         loss_mom = mse_loss(mom_preds, ym)
+        # Régularisation entropie : encourage la diversification des poids
         entropy  = -(gran_w * torch.log(gran_w + 1e-8)).sum(dim=-1).mean()
         loss = loss_pts + LAMBDA_MOM * loss_mom - 0.01 * entropy
         loss.backward()
@@ -543,12 +578,12 @@ def evaluate(model, loader, ce_loss, mse_loss):
     acc      = accuracy_score(labels_all, preds_all)
     mp_all   = np.concatenate(mp_all, axis=0)
     mt_all   = np.concatenate(mt_all, axis=0)
-    mse_pt   = mean_squared_error(mt_all[:,:,0].flatten(), mp_all[:,:,0].flatten())
-    mse_game = mean_squared_error(mt_all[:,:,1].flatten(), mp_all[:,:,1].flatten())
-    mse_set  = mean_squared_error(mt_all[:,:,2].flatten(), mp_all[:,:,2].flatten())
+    mse_psy  = mean_squared_error(mt_all[:,:,0].flatten(), mp_all[:,:,0].flatten())
+    mse_tac  = mean_squared_error(mt_all[:,:,1].flatten(), mp_all[:,:,1].flatten())
+    mse_phy  = mean_squared_error(mt_all[:,:,2].flatten(), mp_all[:,:,2].flatten())
     gran_mean = np.concatenate(gran_weights_all, axis=0).mean(axis=0)
 
-    return total_loss / len(loader), acc, mse_pt, mse_game, mse_set, gran_mean
+    return total_loss / len(loader), acc, mse_psy, mse_tac, mse_phy, gran_mean
 
 
 # ─────────────────────────────────────────────
@@ -558,11 +593,11 @@ if __name__ == "__main__":
     import sys
     CSV_PATH = sys.argv[1] if len(sys.argv) > 1 else "USD.txt"
 
-    print("📂 Chargement + calcul momentum multi-granularité (v3)...")
+    print("📂 Chargement + calcul des 3 signaux hétérogènes (v4)...")
     df = load_and_prepare(CSV_PATH)
     print(f"   {len(df)} points  |  {len(df['match_id'].unique())} matchs")
 
-    # Split sur match_id avant normalisation [v2-FIX 2]
+    # Split sur match_id avant normalisation
     match_ids = df["match_id"].unique()
     np.random.seed(42)
     np.random.shuffle(match_ids)
@@ -575,7 +610,7 @@ if __name__ == "__main__":
     print(f"   Train : {len(df_train)} points ({len(train_ids)} matchs)")
     print(f"   Val   : {len(df_val)} points ({len(val_ids)} matchs)")
 
-    print("\n🔧 Normalisation features (train only) — momentum bruts conservés [FIX A]...")
+    print("\n🔧 Normalisation features (train only) — signaux momentum bruts conservés...")
     df_train, df_val, feat_scaler = fit_and_apply_scalers(df_train, df_val)
 
     print("\n🔨 Construction des séquences...")
@@ -597,13 +632,15 @@ if __name__ == "__main__":
     mse_loss  = nn.MSELoss()
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n🚀 HydraNet MG v3 sur {DEVICE}  |  {n_params:,} paramètres\n")
+    print(f"\n🚀 HydraNet MG v4 sur {DEVICE}  |  {n_params:,} paramètres")
+    print(f"   Signaux : [S1] psycho (haute fréq.)  "
+          f"[S2] tactical (événementiel)  [S3] physical (tendance lente)\n")
 
     best_acc = 0
     for epoch in range(1, EPOCHS + 1):
         tf         = get_tf_ratio(epoch, EPOCHS)
         train_loss = train_epoch(model, train_loader, optimizer, ce_loss, mse_loss, tf)
-        val_loss, val_acc, mse_pt, mse_game, mse_set, gran_w = evaluate(
+        val_loss, val_acc, mse_psy, mse_tac, mse_phy, gran_w = evaluate(
             model, val_loader, ce_loss, mse_loss)
         scheduler.step()
 
@@ -611,8 +648,8 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch:02d}/{EPOCHS} | tf={tf:.2f} | "
               f"loss={train_loss:.4f} | acc={val_acc:.4f} | "
-              f"MSE[pt={mse_pt:.4f} game={mse_game:.4f} set={mse_set:.4f}] | "
-              f"GranW[pt={gran_w[0]:.2f} game={gran_w[1]:.2f} set={gran_w[2]:.2f}] | "
+              f"MSE[psy={mse_psy:.4f} tac={mse_tac:.4f} phy={mse_phy:.4f}] | "
+              f"GranW[psy={gran_w[0]:.2f} tac={gran_w[1]:.2f} phy={gran_w[2]:.2f}] | "
               f"T={temp:.3f}")
 
         if val_acc > best_acc:
@@ -624,13 +661,17 @@ if __name__ == "__main__":
                     "n_heads": N_HEADS, "num_lstm_layers": NUM_LSTM_LAYERS,
                     "conv_k": CONV_KERNEL, "dropout": DROPOUT,
                 },
-            }, "best_hydranet_mg_v3.pt")
-            joblib.dump(feat_scaler, "feat_scaler_mg_v3.pkl")
+            }, "best_hydranet_mg_v4.pt")
+            joblib.dump(feat_scaler, "feat_scaler_mg_v4.pkl")
 
     print(f"\n✅ Meilleure val_acc : {best_acc:.4f}")
     print("\n📊 Poids de granularité moyens (dernière epoch val) :")
-    print(f"   Point : {gran_w[0]:.3f}  |  Jeu : {gran_w[1]:.3f}  |  Set : {gran_w[2]:.3f}")
+    print(f"   Psycho   : {gran_w[0]:.3f}")
+    print(f"   Tactical : {gran_w[1]:.3f}")
+    print(f"   Physical : {gran_w[2]:.3f}")
     print(f"   Temperature finale : {model.encoder.gran_attn.log_temperature.exp().item():.3f}")
-    print("\n   → T < 1 : spécialisation (poids piqués sur une granularité)")
-    print("   → T > 1 : uniformité (le modèle juge les 3 équivalentes)")
-    print("\n   Checkpoint : best_hydranet_mg_v3.pt")
+    print("\n   Interprétation :")
+    print("   → Si psy >> autres : le run de points courant est dominant")
+    print("   → Si tac >> autres : les moments clés (break pts, deuce) sont dominants")
+    print("   → Si phy >> autres : la forme physique relative est dominante")
+    print("\n   Checkpoint : best_hydranet_mg_v4.pt")
