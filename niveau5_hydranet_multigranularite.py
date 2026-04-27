@@ -225,6 +225,13 @@ def load_and_prepare(csv_path: str):
     scaler = StandardScaler()
     df[FEATURE_COLS] = scaler.fit_transform(df[FEATURE_COLS])
 
+    # Normalisation des 3 momentum indépendamment
+    mom_scaler = StandardScaler()
+    df[["mom_point", "mom_game", "mom_set"]] = mom_scaler.fit_transform(
+    df[["mom_point", "mom_game", "mom_set"]]
+    )
+    joblib.dump(mom_scaler, "scaler_mg.pkl")
+
     print(f"   mom_point — mean={df['mom_point'].mean():.3f}  std={df['mom_point'].std():.3f}")
     print(f"   mom_game  — mean={df['mom_game'].mean():.3f}  std={df['mom_game'].std():.3f}")
     print(f"   mom_set   — mean={df['mom_set'].mean():.3f}  std={df['mom_set'].std():.3f}")
