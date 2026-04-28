@@ -1,34 +1,46 @@
 """
-NIVEAU 5 v5 - HydraNet Multi-Granularité (architecture originale stabilisée)
-=============================================================================
+NIVEAU 5 v6 - HydraNet Multi-Granularité (v5 + tous les leviers d'accuracy)
+============================================================================
+Base : v5 (architecture originale + 3 fixes de stabilité)
 
-Diagnostic final après v1→v4 :
-  - L'architecture ORIGINALE (GranularityAttention simple avec feat_emb.mean)
-    faisait bien varier les GranW, mais l'accuracy BAISSAIT à chaque époche.
-  - Les v2/v3/v4 ont corrigé l'accuracy mais cassé les GranW en rendant
-    l'attention trop symétrique.
+3 leviers d'accuracy combinés :
 
-v5 = code original + 3 fixes ciblés sur les causes de baisse d'accuracy :
+  [LEV 1] Features d'interaction tennis (≈+0.5-1% accuracy attendu)
+    Le modèle v5 devait apprendre seul que p1_score=3 ET p2_score=3 = deuce.
+    On lui donne directement ces features explicites :
+      - is_deuce           : score >= 40-40
+      - is_break_point     : break point pour le relanceur
+      - score_pressure     : p1_score * p2_score (interaction continue)
+      - serve_dominance    : ace - double_fault par joueur
+      - winner_ratio       : winners / (winners + unf_err) par joueur
+      - fatigue_proxy      : distance_run * point_no_in_game (accumulation)
+      - momentum_x_score   : mom_point * p1_score (interaction momentum×score)
+    → 10 features supplémentaires, total 35 features temporelles
 
-  [FIX 1] Split sur match_id (pas sur les séquences)
-    Le split original `int(0.8 * len(X_feat))` coupait au milieu des matchs
-    → des séquences du même match se retrouvaient dans train ET val
-    → leakage massif → val_acc artificiellement haute au début, puis chute.
-    Fix : split sur les match_id avant build_sequences, comme en v2/v3/v4.
+  [LEV 2] SEQ_LEN 10→20 (≈+0.3-0.7% accuracy attendu)
+    Avec SEQ_LEN=10, le modèle voyait ≈1.5 jeux.
+    Avec SEQ_LEN=20, il voit ≈3 jeux → peut capter les vraies séries de jeux
+    et les retournements de situation au niveau du set.
+    → Plus de séquences valides par match (window plus large)
 
-  [FIX 2] Scaler fitté sur train uniquement
-    Le StandardScaler original était fitté sur tout le dataset (train+val)
-    → leakage de distribution → comportement instable en val.
-    Fix : fit sur df_train, transform sur df_val.
+  [LEV 3] Contexte match statique injecté dans le context vector (≈+0.5-1%)
+    Le modèle ne savait pas sur quelle surface on joue, ni les rankings
+    relatifs des joueurs. Ces infos sont constantes par match et prédisent
+    structurellement le style de jeu et les probabilités de victoire.
+    Features statiques (par match, constantes sur toute la séquence) :
+      - surface encodée (hard/clay/grass/carpet → embedding 4D)
+      - ranking_diff = p1_rank - p2_rank (normalisé)
+      - ranking_ratio = p1_rank / (p1_rank + p2_rank)
+      - best_of (3 ou 5 sets)
+    → Injectées via un StaticContextNet → vecteur concaténé au context final
 
-  [FIX 3] Teacher forcing décroissant 0.9 → 0.1
-    Le TF fixe à 0.5 forçait le modèle à dépendre de la vraie cible pendant
-    l'inférence → écart train/val grandissant → accuracy val décroissante.
-    Fix : TF décroît linéairement sur les epochs.
-
-  NE PAS TOUCHER : GranularityAttention originale (feat_emb.mean + T=2.0)
-    C'est cette architecture simple qui faisait varier les GranW.
-    Les versions GRU/Bahdanau étaient trop symétriques à l'init.
+  Architecture :
+    HydraEncoderMG (inchangée v5)
+      ↓ context (B, d_model)
+    StaticContextNet(static_feats) → static_ctx (B, d_model//4)
+    concat([context, static_ctx]) → Linear → final_context (B, d_model)
+      ↓
+    HydraPointHead + HydraMomentumHead (inchangés)
 """
 
 import math
@@ -39,13 +51,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, mean_squared_error
 
 # ─────────────────────────────────────────────
 # 1. CONFIGURATION
 # ─────────────────────────────────────────────
-SEQ_LEN         = 10
+SEQ_LEN         = 20          # [LEV 2] 10 → 20
 PRED_LEN        = 5
 BATCH_SIZE      = 64
 D_MODEL         = 128
@@ -68,7 +80,8 @@ MOM_SET_DECAY   = 0.60
 SCORE_MAP = {'0': 0, '15': 1, '30': 2, '40': 3, 'AD': 4,
               0: 0,  15: 1,  30: 2,  40: 3}
 
-FEATURE_COLS = [
+# Features temporelles de base (identiques à v5)
+BASE_FEATURE_COLS = [
     "p1_score", "p2_score",
     "p1_games_won", "p2_games_won",
     "p1_sets", "p2_sets",
@@ -83,32 +96,57 @@ FEATURE_COLS = [
     "p1_set_diff",
     "p1_serve_speed", "p2_serve_speed",
 ]
-TARGET_COL = "Y"
+
+# [LEV 1] Features d'interaction calculées dans load_and_prepare
+INTERACTION_COLS = [
+    "is_deuce",
+    "is_break_point_p1",   # break point pour J1 (J2 sert)
+    "is_break_point_p2",   # break point pour J2 (J1 sert)
+    "score_pressure",      # p1_score * p2_score
+    "p1_serve_dominance",  # ace - double_fault
+    "p2_serve_dominance",
+    "p1_winner_ratio",     # winners / (winners + unf_err + 1)
+    "p2_winner_ratio",
+    "mom_x_score",         # mom_point * p1_score (interaction momentum×score)
+    "score_advantage",     # |p1_score - p2_score| (tension du point)
+]
+
+FEATURE_COLS = BASE_FEATURE_COLS + INTERACTION_COLS  # 35 features au total
+
+# [LEV 3] Features statiques du match
+STATIC_COLS = [
+    "surface_enc",          # surface encodée en entier (→ embedding)
+    "ranking_diff",         # p1_rank - p2_rank normalisé
+    "ranking_ratio",        # p1_rank / (p1_rank + p2_rank)
+    "best_of",              # 3 ou 5 sets
+]
+N_SURFACES  = 5            # hard, clay, grass, carpet, unknown
+
+TARGET_COL  = "Y"
 
 
 # ─────────────────────────────────────────────
-# 2. CALCUL DU MOMENTUM (code original inchangé)
+# 2. CALCUL DU MOMENTUM (identique v5)
 # ─────────────────────────────────────────────
-def compute_momentum_points(results: np.ndarray, window: int, decay: float) -> np.ndarray:
+def compute_momentum_points(results, window, decay):
     signed  = np.where(results == 1, 1.0, -1.0)
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
     momentum = np.zeros(len(signed))
     for t in range(len(signed)):
-        start        = max(0, t - window + 1)
-        w            = weights[-(t - start + 1):]
-        momentum[t]  = np.dot(signed[start : t + 1], w)
+        start       = max(0, t - window + 1)
+        w           = weights[-(t - start + 1):]
+        momentum[t] = np.dot(signed[start:t+1], w)
     return momentum.astype(np.float32)
 
 
-def compute_momentum_games(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
-    momentum = np.zeros(len(df_match))
+def compute_momentum_games(df_match, window, decay):
+    momentum     = np.zeros(len(df_match))
     game_results = {}
     for (s, g), grp in df_match.groupby(["set_no", "game_no"]):
         victor = grp["game_victor"].dropna()
         if len(victor) > 0:
-            last = victor.iloc[-1]
-            game_results[(s, g)] = 1.0 if last == 1 else -1.0
+            game_results[(s, g)] = 1.0 if victor.iloc[-1] == 1 else -1.0
 
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
@@ -123,7 +161,7 @@ def compute_momentum_games(df_match: pd.DataFrame, window: int, decay: float) ->
                     if (ss, gg) in game_results:
                         past_games.append((ss, gg))
         recent = past_games[-window:]
-        if len(recent) == 0:
+        if not recent:
             momentum[idx] = 0.0
         else:
             vals = np.array([game_results[k] for k in recent])
@@ -132,23 +170,22 @@ def compute_momentum_games(df_match: pd.DataFrame, window: int, decay: float) ->
     return momentum.astype(np.float32)
 
 
-def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> np.ndarray:
-    momentum = np.zeros(len(df_match))
+def compute_momentum_sets(df_match, window, decay):
+    momentum    = np.zeros(len(df_match))
     set_results = {}
     for s, grp in df_match.groupby("set_no"):
         victor = grp["set_victor"].dropna()
         if len(victor) > 0:
-            last = victor.iloc[-1]
-            set_results[s] = 1.0 if last == 1 else -1.0
+            set_results[s] = 1.0 if victor.iloc[-1] == 1 else -1.0
 
     weights = np.array([decay ** k for k in range(window)])
     weights /= weights.sum()
 
     for idx, row in df_match.iterrows():
-        s = row["set_no"]
+        s         = row["set_no"]
         past_sets = [ss for ss in range(1, s) if ss in set_results]
         recent    = past_sets[-window:]
-        if len(recent) == 0:
+        if not recent:
             momentum[idx] = 0.0
         else:
             vals = np.array([set_results[ss] for ss in recent])
@@ -158,20 +195,109 @@ def compute_momentum_sets(df_match: pd.DataFrame, window: int, decay: float) -> 
 
 
 # ─────────────────────────────────────────────
-# 3. CHARGEMENT & PRÉPARATION
+# 3. FEATURES D'INTERACTION [LEV 1]
+# ─────────────────────────────────────────────
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    [LEV 1] Ajoute 10 features d'interaction explicites.
+    Appelé AVANT la normalisation (sur les valeurs brutes).
+    """
+    s1 = df["p1_score"].fillna(0).astype(int)
+    s2 = df["p2_score"].fillna(0).astype(int)
+
+    # Deuce : les deux joueurs à 40+ (encodé ≥ 3)
+    df["is_deuce"] = ((s1 >= 3) & (s2 >= 3)).astype(np.float32)
+
+    # Break point pour J1 : J2 sert (p2_serve=1), J1 à 40 ou AD, J2 derrière
+    df["is_break_point_p1"] = (
+        (df["p2_serve"].fillna(0) == 1) & (s1 >= 3) & (s2 < s1)
+    ).astype(np.float32)
+
+    # Break point pour J2 : J1 sert (p1_serve=1), J2 à 40 ou AD, J1 derrière
+    df["is_break_point_p2"] = (
+        (df["p1_serve"].fillna(0) == 1) & (s2 >= 3) & (s1 < s2)
+    ).astype(np.float32)
+
+    # Interaction continue score (tension du jeu)
+    df["score_pressure"]  = (s1 * s2).astype(np.float32)
+    df["score_advantage"] = (s1 - s2).abs().astype(np.float32)
+
+    # Dominance au service
+    df["p1_serve_dominance"] = (
+        df["p1_ace"].fillna(0) - df["p1_double_fault"].fillna(0)
+    ).astype(np.float32)
+    df["p2_serve_dominance"] = (
+        df["p2_ace"].fillna(0) - df["p2_double_fault"].fillna(0)
+    ).astype(np.float32)
+
+    # Ratio winner (efficacité offensive)
+    df["p1_winner_ratio"] = (
+        df["p1_winner"].fillna(0) /
+        (df["p1_winner"].fillna(0) + df["p1_unf_err"].fillna(0) + 1)
+    ).astype(np.float32)
+    df["p2_winner_ratio"] = (
+        df["p2_winner"].fillna(0) /
+        (df["p2_winner"].fillna(0) + df["p2_unf_err"].fillna(0) + 1)
+    ).astype(np.float32)
+
+    # Interaction momentum × score (sera calculée après le momentum)
+    # Initialisée à 0, remplie dans load_and_prepare après le calcul momentum
+    df["mom_x_score"] = 0.0
+
+    return df
+
+
+def add_static_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    [LEV 3] Ajoute les features statiques du match (constantes par match_id).
+    surface → encodée ordinalement (0=unknown, 1=hard, 2=clay, 3=grass, 4=carpet)
+    ranking_diff, ranking_ratio → normalisées plus bas
+    best_of → 3 ou 5, normalisé
+    """
+    surface_map = {"hard": 1, "clay": 2, "grass": 3, "carpet": 4,
+                   "Hard": 1, "Clay": 2, "Grass": 3, "Carpet": 4}
+
+    if "surface" in df.columns:
+        df["surface_enc"] = df["surface"].map(surface_map).fillna(0).astype(np.float32)
+    else:
+        df["surface_enc"] = 0.0
+
+    if "p1_rank" in df.columns and "p2_rank" in df.columns:
+        r1 = df["p1_rank"].fillna(200).astype(float)
+        r2 = df["p2_rank"].fillna(200).astype(float)
+        df["ranking_diff"]  = (r1 - r2).astype(np.float32)
+        df["ranking_ratio"] = (r1 / (r1 + r2 + 1e-8)).astype(np.float32)
+    else:
+        df["ranking_diff"]  = 0.0
+        df["ranking_ratio"] = 0.5
+
+    if "best_of" in df.columns:
+        df["best_of"] = df["best_of"].fillna(3).astype(np.float32) / 5.0
+    else:
+        df["best_of"] = 0.6   # 3/5 par défaut
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# 4. CHARGEMENT & PRÉPARATION
 # ─────────────────────────────────────────────
 def load_and_prepare(csv_path: str) -> pd.DataFrame:
-    """
-    Charge le CSV et calcule les 3 momentum bruts.
-    [FIX 2] La normalisation est déplacée après le split train/val.
-    """
     df = pd.read_csv(csv_path, sep=",", low_memory=False)
+
     df["p1_score"] = df["p1_score"].map(SCORE_MAP)
     df["p2_score"] = df["p2_score"].map(SCORE_MAP)
-    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL])
+
+    # [LEV 1] Features d'interaction (avant dropna pour avoir les scores)
+    df = add_interaction_features(df)
+    # [LEV 3] Features statiques
+    df = add_static_features(df)
+
+    df = df.dropna(subset=BASE_FEATURE_COLS + [TARGET_COL])
     df[TARGET_COL] = (df[TARGET_COL] == 1).astype(int)
     df = df.reset_index(drop=True)
 
+    # Calcul momentum par match
     mom_pt_list, mom_game_list, mom_set_list = [], [], []
     for _, match in df.groupby("match_id"):
         match = match.sort_values("point_no").reset_index(drop=True)
@@ -186,20 +312,27 @@ def load_and_prepare(csv_path: str) -> pd.DataFrame:
     df["mom_point"] = mom_pt_list
     df["mom_game"]  = mom_game_list
     df["mom_set"]   = mom_set_list
+
+    # [LEV 1] Interaction momentum × score (maintenant que le momentum est calculé)
+    df["mom_x_score"] = (df["mom_point"] * df["p1_score"].fillna(0)).astype(np.float32)
+
+    print(f"   Features temporelles : {len(FEATURE_COLS)} "
+          f"(base={len(BASE_FEATURE_COLS)} + interaction={len(INTERACTION_COLS)})")
+    print(f"   Features statiques   : {len(STATIC_COLS)}")
+    print(f"   mom_point — mean={df['mom_point'].mean():.3f}  std={df['mom_point'].std():.3f}")
+    print(f"   mom_game  — mean={df['mom_game'].mean():.3f}  std={df['mom_game'].std():.3f}")
+    print(f"   mom_set   — mean={df['mom_set'].mean():.3f}  std={df['mom_set'].std():.3f}")
+
     return df
 
 
 def fit_and_apply_scalers(df_train: pd.DataFrame, df_val: pd.DataFrame):
-    """
-    [FIX 2] Fit sur train uniquement.
-    On normalise features ET momentum séparément mais tous deux sur train only.
-    On conserve la co-normalisation des momentum (comme l'original) car c'est
-    ce qui permettait aux GranW de varier — la température T=2.0 compensait
-    le fait que les 3 canaux avaient std≈1.
-    """
+    """Fit sur train uniquement (FIX 2 de v5, conservé)."""
     feat_scaler = StandardScaler()
-    df_train[FEATURE_COLS] = feat_scaler.fit_transform(df_train[FEATURE_COLS])
-    df_val[FEATURE_COLS]   = feat_scaler.transform(df_val[FEATURE_COLS])
+    df_train[FEATURE_COLS] = feat_scaler.fit_transform(
+        df_train[FEATURE_COLS].fillna(0))
+    df_val[FEATURE_COLS]   = feat_scaler.transform(
+        df_val[FEATURE_COLS].fillna(0))
 
     mom_scaler = StandardScaler()
     df_train[["mom_point", "mom_game", "mom_set"]] = mom_scaler.fit_transform(
@@ -207,48 +340,65 @@ def fit_and_apply_scalers(df_train: pd.DataFrame, df_val: pd.DataFrame):
     df_val[["mom_point", "mom_game", "mom_set"]] = mom_scaler.transform(
         df_val[["mom_point", "mom_game", "mom_set"]])
 
-    print(f"   mom_point — mean={df_train['mom_point'].mean():.3f}  std={df_train['mom_point'].std():.3f}")
-    print(f"   mom_game  — mean={df_train['mom_game'].mean():.3f}  std={df_train['mom_game'].std():.3f}")
-    print(f"   mom_set   — mean={df_train['mom_set'].mean():.3f}  std={df_train['mom_set'].std():.3f}")
+    # [LEV 3] Normalisation features statiques (sur train)
+    static_scaler = StandardScaler()
+    df_train[["ranking_diff", "ranking_ratio", "best_of"]] = \
+        static_scaler.fit_transform(
+            df_train[["ranking_diff", "ranking_ratio", "best_of"]].fillna(0))
+    df_val[["ranking_diff", "ranking_ratio", "best_of"]] = \
+        static_scaler.transform(
+            df_val[["ranking_diff", "ranking_ratio", "best_of"]].fillna(0))
+    # surface_enc reste entier (→ embedding dans le modèle)
 
-    return df_train, df_val, feat_scaler, mom_scaler
+    return df_train, df_val, feat_scaler, mom_scaler, static_scaler
 
 
 # ─────────────────────────────────────────────
-# 4. CONSTRUCTION DES SÉQUENCES
+# 5. CONSTRUCTION DES SÉQUENCES
 # ─────────────────────────────────────────────
 def build_sequences(df: pd.DataFrame):
-    X_feat, X_mom, y_points, y_mom = [], [], [], []
+    """
+    Retourne aussi X_static : (N, 4) — features statiques par séquence.
+    La surface est gardée comme entier pour l'embedding.
+    """
+    X_feat, X_mom, X_static, y_points, y_mom = [], [], [], [], []
+
     for _, match in df.groupby("match_id"):
         match    = match.sort_values("point_no").reset_index(drop=True)
-        features = match[FEATURE_COLS].values
-        points   = match[TARGET_COL].values
-        moms     = match[["mom_point", "mom_game", "mom_set"]].values
+        features = match[FEATURE_COLS].fillna(0).values          # (T, 35)
+        points   = match[TARGET_COL].values                       # (T,)
+        moms     = match[["mom_point", "mom_game", "mom_set"]].values  # (T, 3)
+        # Features statiques : identiques pour toute la séquence
+        static   = match[STATIC_COLS].fillna(0).values            # (T, 4)
 
         for i in range(len(match) - SEQ_LEN - PRED_LEN + 1):
             X_feat.append(features[i : i + SEQ_LEN])
             X_mom.append(moms[i : i + SEQ_LEN])
+            X_static.append(static[i])                            # (4,) — constante
             y_points.append(points[i + SEQ_LEN : i + SEQ_LEN + PRED_LEN])
             y_mom.append(moms[i + SEQ_LEN : i + SEQ_LEN + PRED_LEN])
 
-    return (np.array(X_feat,   dtype=np.float32),
-            np.array(X_mom,    dtype=np.float32),
-            np.array(y_points, dtype=np.int64),
-            np.array(y_mom,    dtype=np.float32))
+    return (np.array(X_feat,    dtype=np.float32),
+            np.array(X_mom,     dtype=np.float32),
+            np.array(X_static,  dtype=np.float32),
+            np.array(y_points,  dtype=np.int64),
+            np.array(y_mom,     dtype=np.float32))
 
 
 class TennisDataset(Dataset):
-    def __init__(self, Xf, Xm, yp, ym):
+    def __init__(self, Xf, Xm, Xs, yp, ym):
         self.Xf = torch.tensor(Xf)
         self.Xm = torch.tensor(Xm)
+        self.Xs = torch.tensor(Xs)
         self.yp = torch.tensor(yp)
         self.ym = torch.tensor(ym)
     def __len__(self): return len(self.yp)
-    def __getitem__(self, i): return self.Xf[i], self.Xm[i], self.yp[i], self.ym[i]
+    def __getitem__(self, i):
+        return self.Xf[i], self.Xm[i], self.Xs[i], self.yp[i], self.ym[i]
 
 
 # ─────────────────────────────────────────────
-# 5. ARCHITECTURE (originale, inchangée)
+# 6. ARCHITECTURE
 # ─────────────────────────────────────────────
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size):
@@ -274,22 +424,9 @@ class PositionalEncoding(nn.Module):
 
 
 class GranularityAttention(nn.Module):
-    """
-    Architecture ORIGINALE — conservée telle quelle car c'est elle
-    qui faisait varier les GranW.
-
-    Pourquoi elle fonctionne mieux que les versions GRU/Bahdanau :
-      - feat_emb.mean(dim=1) produit un contexte différent pour chaque batch,
-        ce qui crée de la variance dans les scores d'attention.
-      - La température fixe T=2.0 empêche le softmax de coller à 0.33
-        sans forcer la spécialisation.
-      - Le réseau attn_net (Linear→Tanh→Linear) a des poids initialisés
-        aléatoirement de façon asymétrique entre les 3 sorties → brise
-        la symétrie dès l'epoch 1.
-    """
+    """Architecture originale conservée (fait varier les GranW)."""
     def __init__(self, d_model, n_gran=3):
         super().__init__()
-        self.n_gran   = n_gran
         self.proj     = nn.Linear(1, d_model)
         self.attn_net = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -299,15 +436,38 @@ class GranularityAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(self, x_mom, context):
-        """
-        x_mom   : (B, T, 3)
-        context : (B, d_model) — feat_emb.mean(dim=1) depuis l'encoder
-        """
         TEMPERATURE  = 2.0
-        attn_weights = torch.softmax(self.attn_net(context) / TEMPERATURE, dim=-1)  # (B, 3)
-        weighted     = (x_mom * attn_weights.unsqueeze(1)).sum(dim=-1, keepdim=True) # (B, T, 1)
-        out          = self.proj(weighted)       # (B, T, d_model)
+        attn_weights = torch.softmax(self.attn_net(context) / TEMPERATURE, dim=-1)
+        weighted     = (x_mom * attn_weights.unsqueeze(1)).sum(dim=-1, keepdim=True)
+        out          = self.proj(weighted)
         return self.out_proj(out), attn_weights
+
+
+class StaticContextNet(nn.Module):
+    """
+    [LEV 3] Encode les features statiques du match en un vecteur de contexte.
+    La surface est encodée via un embedding appris, les autres features
+    sont projetées depuis leur valeur normalisée.
+    """
+    def __init__(self, n_surfaces, d_out):
+        super().__init__()
+        self.surface_emb = nn.Embedding(n_surfaces, 8)
+        # surface_emb(8) + ranking_diff(1) + ranking_ratio(1) + best_of(1) = 11
+        self.net = nn.Sequential(
+            nn.Linear(11, d_out),
+            nn.ReLU(),
+            nn.Linear(d_out, d_out),
+        )
+
+    def forward(self, x_static):
+        """
+        x_static : (B, 4) — [surface_enc, ranking_diff, ranking_ratio, best_of]
+        """
+        surface_idx  = x_static[:, 0].long().clamp(0, N_SURFACES - 1)
+        surface_emb  = self.surface_emb(surface_idx)          # (B, 8)
+        other        = x_static[:, 1:]                        # (B, 3)
+        combined     = torch.cat([surface_emb, other], dim=-1) # (B, 11)
+        return self.net(combined)                              # (B, d_out)
 
 
 class HydraEncoderMG(nn.Module):
@@ -328,8 +488,8 @@ class HydraEncoderMG(nn.Module):
         self.dropout    = nn.Dropout(dropout)
 
     def forward(self, x_feat, x_mom):
-        feat_emb = self.feat_proj(x_feat)             # (B, T, d_model)
-        context  = feat_emb.mean(dim=1)               # (B, d_model) — original conservé
+        feat_emb = self.feat_proj(x_feat)
+        context  = feat_emb.mean(dim=1)
         mom_emb, gran_weights = self.gran_attn(x_mom, context)
 
         x = self.fusion_in(torch.cat([feat_emb, mom_emb], dim=-1))
@@ -392,38 +552,65 @@ class HydraMomentumHead(nn.Module):
 
 
 class HydraNetMG(nn.Module):
-    def __init__(self, feat_size, d_model, n_heads, num_lstm_layers, conv_k, dropout):
+    """
+    HydraNet v6 : encoder temporel + contexte statique match [LEV 3].
+
+    Le context vector final est enrichi par StaticContextNet avant
+    d'être passé aux têtes de prédiction.
+    """
+    def __init__(self, feat_size, d_model, n_heads, num_lstm_layers, conv_k, dropout,
+                 n_surfaces=N_SURFACES):
         super().__init__()
+        static_dim = d_model // 4   # 32
+
         self.encoder       = HydraEncoderMG(feat_size, d_model, n_heads,
                                              num_lstm_layers, conv_k, dropout)
+        self.static_net    = StaticContextNet(n_surfaces, static_dim)  # [LEV 3]
+        # Fusion context temporel + context statique
+        self.ctx_fusion    = nn.Sequential(
+            nn.Linear(d_model + static_dim, d_model),
+            nn.ReLU(),
+        )
         self.point_head    = HydraPointHead(d_model, num_lstm_layers, dropout)
-        self.momentum_head = HydraMomentumHead(d_model, num_lstm_layers, dropout, n_gran=3)
+        self.momentum_head = HydraMomentumHead(d_model, num_lstm_layers, dropout)
 
-    def forward(self, x_feat, x_mom, pred_len,
+    def forward(self, x_feat, x_mom, x_static, pred_len,
                 y_points=None, y_mom=None, tf_ratio=0.5):
-        context, h, c, gran_weights = self.encoder(x_feat, x_mom)
-        point_logits = self.point_head(context, h.clone(), c.clone(),
+        # Encoder temporel
+        temp_ctx, h, c, gran_weights = self.encoder(x_feat, x_mom)
+
+        # Contexte statique [LEV 3]
+        static_ctx = self.static_net(x_static)                    # (B, static_dim)
+
+        # Fusion : contexte enrichi
+        final_ctx  = self.ctx_fusion(
+            torch.cat([temp_ctx, static_ctx], dim=-1))             # (B, d_model)
+
+        point_logits = self.point_head(final_ctx, h.clone(), c.clone(),
                                        pred_len, y_points, tf_ratio)
-        mom_preds    = self.momentum_head(context, h.clone(), c.clone(),
+        mom_preds    = self.momentum_head(final_ctx, h.clone(), c.clone(),
                                           pred_len, y_mom, tf_ratio)
         return point_logits, mom_preds, gran_weights
 
 
 # ─────────────────────────────────────────────
-# 6. ENTRAÎNEMENT & ÉVALUATION
+# 7. ENTRAÎNEMENT & ÉVALUATION
 # ─────────────────────────────────────────────
-def get_tf_ratio(epoch: int, total: int, start=0.9, end=0.1) -> float:
-    """[FIX 3] Teacher forcing décroissant linéairement."""
+def get_tf_ratio(epoch, total, start=0.9, end=0.1):
     return start + (end - start) * (epoch - 1) / max(total - 1, 1)
 
 
-def train_epoch(model, loader, optimizer, ce_loss, mse_loss, tf_ratio: float):
+def train_epoch(model, loader, optimizer, ce_loss, mse_loss, tf_ratio):
     model.train()
     total_loss = 0
-    for Xf, Xm, yp, ym in loader:
-        Xf, Xm, yp, ym = Xf.to(DEVICE), Xm.to(DEVICE), yp.to(DEVICE), ym.to(DEVICE)
+    for Xf, Xm, Xs, yp, ym in loader:
+        Xf  = Xf.to(DEVICE)
+        Xm  = Xm.to(DEVICE)
+        Xs  = Xs.to(DEVICE)
+        yp  = yp.to(DEVICE)
+        ym  = ym.to(DEVICE)
         optimizer.zero_grad()
-        logits, mom_preds, gran_w = model(Xf, Xm, PRED_LEN, yp, ym, tf_ratio=tf_ratio)
+        logits, mom_preds, gran_w = model(Xf, Xm, Xs, PRED_LEN, yp, ym, tf_ratio)
         loss_pts = ce_loss(logits.view(-1, 2), yp.view(-1))
         loss_mom = mse_loss(mom_preds, ym)
         entropy  = -(gran_w * torch.log(gran_w + 1e-8)).sum(dim=-1).mean()
@@ -443,9 +630,10 @@ def evaluate(model, loader, ce_loss, mse_loss):
     gran_weights_all      = []
 
     with torch.no_grad():
-        for Xf, Xm, yp, ym in loader:
-            Xf, Xm, yp, ym = Xf.to(DEVICE), Xm.to(DEVICE), yp.to(DEVICE), ym.to(DEVICE)
-            logits, mom_preds, gran_w = model(Xf, Xm, PRED_LEN, tf_ratio=0.0)
+        for Xf, Xm, Xs, yp, ym in loader:
+            Xf, Xm, Xs = Xf.to(DEVICE), Xm.to(DEVICE), Xs.to(DEVICE)
+            yp, ym      = yp.to(DEVICE), ym.to(DEVICE)
+            logits, mom_preds, gran_w = model(Xf, Xm, Xs, PRED_LEN, tf_ratio=0.0)
             loss = (ce_loss(logits.view(-1, 2), yp.view(-1))
                     + LAMBDA_MOM * mse_loss(mom_preds, ym))
             total_loss += loss.item()
@@ -467,17 +655,17 @@ def evaluate(model, loader, ce_loss, mse_loss):
 
 
 # ─────────────────────────────────────────────
-# 7. MAIN
+# 8. MAIN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
     CSV_PATH = sys.argv[1] if len(sys.argv) > 1 else "USD.txt"
 
-    print("📂 Chargement + calcul momentum multi-granularité (v5)...")
+    print("📂 Chargement + features d'interaction + momentum (v6)...")
     df = load_and_prepare(CSV_PATH)
     print(f"   {len(df)} points  |  {len(df['match_id'].unique())} matchs")
 
-    # [FIX 1] Split sur match_id AVANT build_sequences et normalisation
+    # Split sur match_id avant normalisation (FIX 1 de v5)
     match_ids = df["match_id"].unique()
     np.random.seed(42)
     np.random.shuffle(match_ids)
@@ -490,36 +678,45 @@ if __name__ == "__main__":
     print(f"   Train : {len(df_train)} points ({len(train_ids)} matchs)")
     print(f"   Val   : {len(df_val)} points ({len(val_ids)} matchs)")
 
-    # [FIX 2] Normalisation après split, fit sur train only
-    print("\n🔧 Normalisation (fit sur train uniquement) [FIX 2]...")
-    df_train, df_val, feat_scaler, mom_scaler = fit_and_apply_scalers(df_train, df_val)
+    print("\n🔧 Normalisation (train only)...")
+    df_train, df_val, feat_scaler, mom_scaler, static_scaler = \
+        fit_and_apply_scalers(df_train, df_val)
 
-    print("\n🔨 Construction des séquences [FIX 1]...")
-    X_feat_tr, X_mom_tr, y_pts_tr, y_mom_tr = build_sequences(df_train)
-    X_feat_vl, X_mom_vl, y_pts_vl, y_mom_vl = build_sequences(df_val)
-    print(f"   Train — X_feat={X_feat_tr.shape}  X_mom={X_mom_tr.shape}")
-    print(f"   Val   — X_feat={X_feat_vl.shape}  X_mom={X_mom_vl.shape}")
+    print(f"\n🔨 Construction des séquences (SEQ_LEN={SEQ_LEN}) [LEV 2]...")
+    X_feat_tr, X_mom_tr, X_static_tr, y_pts_tr, y_mom_tr = build_sequences(df_train)
+    X_feat_vl, X_mom_vl, X_static_vl, y_pts_vl, y_mom_vl = build_sequences(df_val)
+    print(f"   Train — X_feat={X_feat_tr.shape}  X_mom={X_mom_tr.shape}  "
+          f"X_static={X_static_tr.shape}")
+    print(f"   Val   — X_feat={X_feat_vl.shape}  X_mom={X_mom_vl.shape}  "
+          f"X_static={X_static_vl.shape}")
 
-    train_ds     = TennisDataset(X_feat_tr, X_mom_tr, y_pts_tr, y_mom_tr)
-    val_ds       = TennisDataset(X_feat_vl, X_mom_vl, y_pts_vl, y_mom_vl)
+    train_ds = TennisDataset(X_feat_tr, X_mom_tr, X_static_tr, y_pts_tr, y_mom_tr)
+    val_ds   = TennisDataset(X_feat_vl, X_mom_vl, X_static_vl, y_pts_vl, y_mom_vl)
     train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,  pin_memory=(DEVICE=="cuda"))
     val_loader   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False, pin_memory=(DEVICE=="cuda"))
 
-    model     = HydraNetMG(len(FEATURE_COLS), D_MODEL, N_HEADS,
-                            NUM_LSTM_LAYERS, CONV_KERNEL, DROPOUT).to(DEVICE)
+    model = HydraNetMG(
+        feat_size=len(FEATURE_COLS),
+        d_model=D_MODEL, n_heads=N_HEADS,
+        num_lstm_layers=NUM_LSTM_LAYERS,
+        conv_k=CONV_KERNEL, dropout=DROPOUT,
+    ).to(DEVICE)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     ce_loss   = nn.CrossEntropyLoss()
     mse_loss  = nn.MSELoss()
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n🚀 HydraNet MG v5 sur {DEVICE}  |  {n_params:,} paramètres")
-    print(f"   Architecture originale + [FIX 1] split match_id "
-          f"+ [FIX 2] scaler train-only + [FIX 3] TF décroissant\n")
+    print(f"\n🚀 HydraNet MG v6 sur {DEVICE}  |  {n_params:,} paramètres")
+    print(f"   [LEV 1] {len(FEATURE_COLS)} features temporelles "
+          f"(+{len(INTERACTION_COLS)} interactions)")
+    print(f"   [LEV 2] SEQ_LEN={SEQ_LEN}")
+    print(f"   [LEV 3] Contexte statique match (surface + rankings + best_of)\n")
 
     best_acc = 0
     for epoch in range(1, EPOCHS + 1):
-        tf         = get_tf_ratio(epoch, EPOCHS)   # [FIX 3]
+        tf         = get_tf_ratio(epoch, EPOCHS)
         train_loss = train_epoch(model, train_loader, optimizer, ce_loss, mse_loss, tf)
         val_loss, val_acc, mse_pt, mse_game, mse_set, gran_w = evaluate(
             model, val_loader, ce_loss, mse_loss)
@@ -539,16 +736,14 @@ if __name__ == "__main__":
                     "n_heads": N_HEADS, "num_lstm_layers": NUM_LSTM_LAYERS,
                     "conv_k": CONV_KERNEL, "dropout": DROPOUT,
                 },
-            }, "best_hydranet_mg_v5.pt")
-            joblib.dump(feat_scaler, "feat_scaler_mg_v5.pkl")
-            joblib.dump(mom_scaler,  "mom_scaler_mg_v5.pkl")
+            }, "best_hydranet_mg_v6.pt")
+            joblib.dump(feat_scaler,   "feat_scaler_mg_v6.pkl")
+            joblib.dump(mom_scaler,    "mom_scaler_mg_v6.pkl")
+            joblib.dump(static_scaler, "static_scaler_mg_v6.pkl")
 
     print(f"\n✅ Meilleure val_acc : {best_acc:.4f}")
     print("\n📊 Poids de granularité moyens (dernière epoch val) :")
     print(f"   Point : {gran_w[0]:.3f}  |  Jeu : {gran_w[1]:.3f}  |  Set : {gran_w[2]:.3f}")
-    print("\n   Interprétation :")
-    print("   → La granularité dominante est celle que le modèle juge la plus")
-    print("     informative en moyenne sur les matchs de validation.")
-    print("   → Des poids variables entre matchs (visible en mode debug) indiquent")
-    print("     que le contexte influence bien le choix de granularité.")
-    print("\n   Checkpoints : best_hydranet_mg_v5.pt, feat_scaler_mg_v5.pkl, mom_scaler_mg_v5.pkl")
+    print("\n   Note : si ranking_diff/surface_enc sont à 0 (colonnes absentes du CSV),")
+    print("   le LEV 3 n'apportera pas de gain — vérifier les noms de colonnes.")
+    print("\n   Checkpoints : best_hydranet_mg_v6.pt + 3 scalers")
