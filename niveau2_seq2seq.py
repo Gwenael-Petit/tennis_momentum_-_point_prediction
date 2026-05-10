@@ -19,7 +19,7 @@ from sklearn.metrics import accuracy_score
 # ══════════════════════════════════════════════
 # CONFIGURATION
 # ══════════════════════════════════════════════
-BASE_DIR    = "/content/drive/MyDrive/tennis_project"
+BASE_DIR    = "/content/tennis_project"
 CSV_PATH    = f"{BASE_DIR}/USD.txt"
 
 SEQ_LEN     = 10
