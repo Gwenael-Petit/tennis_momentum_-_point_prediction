@@ -188,13 +188,16 @@ def evaluate(model, loader, ce, mse):
             xf,xm,yp,ym = xf.to(DEVICE),xm.to(DEVICE),yp.to(DEVICE),ym.to(DEVICE)
             logits,mp = model(xf,xm,PRED_LEN,tf=0.0)
             total += (ce(logits.view(-1,2),yp.view(-1))+LAMBDA_MOMENTUM*mse(mp,ym)).item()
-            preds.extend(logits.argmax(-1).cpu().numpy().flatten())
-            labels.extend(yp.cpu().numpy().flatten())
+            preds.append(logits.argmax(-1).cpu().numpy())    # (B, PRED_LEN)
+            labels.append(yp.cpu().numpy())
             mp_all.extend(mp.cpu().numpy().flatten())
             mt_all.extend(ym.cpu().numpy().flatten())
-    return (total/len(loader),
-            accuracy_score(labels,preds),
-            mean_squared_error(mt_all,mp_all))
+    preds  = np.concatenate(preds)    # (N, PRED_LEN)
+    labels = np.concatenate(labels)
+    acc_t1  = accuracy_score(labels[:,0], preds[:,0])   # t+1 uniquement
+    acc_all = accuracy_score(labels.flatten(), preds.flatten())
+    return (total/len(loader), acc_t1, acc_all,
+            mean_squared_error(mt_all, mp_all))
 
 
 # ──────────────────────────────────────────────
@@ -242,14 +245,13 @@ print(f"\n🚀 Entraînement sur {DEVICE}  |  "
 
 best_acc = 0
 for epoch in range(1, EPOCHS+1):
-    train_loss             = train_epoch(model, train_loader, optimizer, ce_loss, mse_loss)
-    val_loss,val_acc,m_mse = evaluate(model, val_loader, ce_loss, mse_loss)
+    train_loss                    = train_epoch(model, train_loader, optimizer, ce_loss, mse_loss)
+    val_loss,val_acc,val_acc_all,m_mse = evaluate(model, val_loader, ce_loss, mse_loss)
     print(f"Epoch {epoch:02d}/{EPOCHS} | loss={train_loss:.4f} | "
-          f"val_acc={val_acc:.4f} | mom_MSE={m_mse:.4f}")
+          f"acc(t+1)={val_acc:.4f} | acc(all)={val_acc_all:.4f} | mom_MSE={m_mse:.4f}")
     if val_acc > best_acc:
         best_acc = val_acc
-        # [FIX 3] Sauvegarde dans Drive
         torch.save(model.state_dict(), f"{BASE_DIR}/best_seq2seq_momentum.pt")
 
-print(f"\n✅ Meilleure val_acc : {best_acc:.4f}")
+print(f"\n✅ Meilleure acc (t+1) : {best_acc:.4f}")
 print(f"   Checkpoint : {BASE_DIR}/best_seq2seq_momentum.pt")

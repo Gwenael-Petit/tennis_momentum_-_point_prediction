@@ -134,9 +134,13 @@ def evaluate(model, loader, criterion):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             logits = model(xb, PRED_LEN, tf=0.0)
             total += criterion(logits.view(-1,2), yb.view(-1)).item()
-            preds.extend(logits.argmax(-1).cpu().numpy().flatten())
-            labels.extend(yb.cpu().numpy().flatten())
-    return total/len(loader), accuracy_score(labels, preds)
+            preds.append(logits.argmax(-1).cpu().numpy())    # (B, PRED_LEN)
+            labels.append(yb.cpu().numpy())
+    preds  = np.concatenate(preds)    # (N, PRED_LEN)
+    labels = np.concatenate(labels)
+    acc_t1  = accuracy_score(labels[:,0], preds[:,0])   # t+1 uniquement
+    acc_all = accuracy_score(labels.flatten(), preds.flatten())
+    return total/len(loader), acc_t1, acc_all
 
 
 # ──────────────────────────────────────────────
@@ -180,12 +184,12 @@ print(f"\n🚀 Entraînement sur {DEVICE}  |  "
 best_acc = 0
 for epoch in range(1, EPOCHS+1):
     train_loss        = train_epoch(model, train_loader, optimizer, criterion)
-    val_loss, val_acc = evaluate(model, val_loader, criterion)
-    print(f"Epoch {epoch:02d}/{EPOCHS} | loss={train_loss:.4f} | val_acc={val_acc:.4f}")
+    val_loss, val_acc, val_acc_all = evaluate(model, val_loader, criterion)
+    print(f"Epoch {epoch:02d}/{EPOCHS} | loss={train_loss:.4f} | "
+          f"acc(t+1)={val_acc:.4f} | acc(all)={val_acc_all:.4f}")
     if val_acc > best_acc:
         best_acc = val_acc
-        # [FIX 3] Sauvegarde dans Drive
         torch.save(model.state_dict(), f"{BASE_DIR}/best_seq2seq.pt")
 
-print(f"\n✅ Meilleure val_acc : {best_acc:.4f}")
+print(f"\n✅ Meilleure acc (t+1) : {best_acc:.4f}")
 print(f"   Checkpoint : {BASE_DIR}/best_seq2seq.pt")
